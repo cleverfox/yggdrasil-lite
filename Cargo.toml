@@ -11,7 +11,6 @@ curve25519-dalek = { version = "4", default-features = false }
 crypto_box = { version = "0.9", default-features = false, features = ["salsa20", "alloc"] }
 sha2 = { version = "0.10", default-features = false }
 blake2 = { version = "0.10", default-features = false }
-murmur3 = "0.5"
 rand_core = { version = "0.6", default-features = false }
 
 [features]

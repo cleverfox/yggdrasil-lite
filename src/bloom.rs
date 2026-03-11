@@ -7,7 +7,6 @@
 //! Adapted from ironwood/src/bloom.rs for no_std.
 
 use alloc::vec::Vec;
-use murmur3::murmur3_x64_128;
 use crate::crypto::PublicKey;
 use crate::wire;
 
@@ -242,22 +241,100 @@ impl LeafBlooms {
 }
 
 // ---------------------------------------------------------------------------
-// Murmur3 hashing (compatible with Go's bits-and-blooms)
+// Murmur3 x64_128 (inline, no_std compatible)
 // ---------------------------------------------------------------------------
+
+/// MurmurHash3 x64_128 — produces a 128-bit hash as (u64, u64).
+/// Wire-compatible with the Go/C++ reference implementation and the
+/// `murmur3` crate's `murmur3_x64_128(data, seed=0)`.
+fn murmur3_x64_128(data: &[u8], seed: u64) -> (u64, u64) {
+    const C1: u64 = 0x87c3_7b91_1142_53d5;
+    const C2: u64 = 0x4cf5_ad43_2745_937f;
+
+    let mut h1: u64 = seed;
+    let mut h2: u64 = seed;
+    let len = data.len();
+
+    // Process 16-byte chunks
+    let nblocks = len / 16;
+    for i in 0..nblocks {
+        let off = i * 16;
+        let mut k1 = u64::from_le_bytes(data[off..off + 8].try_into().unwrap());
+        let mut k2 = u64::from_le_bytes(data[off + 8..off + 16].try_into().unwrap());
+
+        k1 = k1.wrapping_mul(C1);
+        k1 = k1.rotate_left(31);
+        k1 = k1.wrapping_mul(C2);
+        h1 ^= k1;
+        h1 = h1.rotate_left(27);
+        h1 = h1.wrapping_add(h2);
+        h1 = h1.wrapping_mul(5).wrapping_add(0x52dc_e729);
+
+        k2 = k2.wrapping_mul(C2);
+        k2 = k2.rotate_left(33);
+        k2 = k2.wrapping_mul(C1);
+        h2 ^= k2;
+        h2 = h2.rotate_left(31);
+        h2 = h2.wrapping_add(h1);
+        h2 = h2.wrapping_mul(5).wrapping_add(0x3849_5ab5);
+    }
+
+    // Tail
+    let tail = &data[nblocks * 16..];
+    let mut k1: u64 = 0;
+    let mut k2: u64 = 0;
+
+    match tail.len() {
+        15 => { k2 ^= (tail[14] as u64) << 48; k2 ^= (tail[13] as u64) << 40; k2 ^= (tail[12] as u64) << 32; k2 ^= (tail[11] as u64) << 24; k2 ^= (tail[10] as u64) << 16; k2 ^= (tail[9] as u64) << 8; k2 ^= tail[8] as u64; k2 = k2.wrapping_mul(C2); k2 = k2.rotate_left(33); k2 = k2.wrapping_mul(C1); h2 ^= k2; k1 ^= (tail[7] as u64) << 56; k1 ^= (tail[6] as u64) << 48; k1 ^= (tail[5] as u64) << 40; k1 ^= (tail[4] as u64) << 32; k1 ^= (tail[3] as u64) << 24; k1 ^= (tail[2] as u64) << 16; k1 ^= (tail[1] as u64) << 8; k1 ^= tail[0] as u64; k1 = k1.wrapping_mul(C1); k1 = k1.rotate_left(31); k1 = k1.wrapping_mul(C2); h1 ^= k1; }
+        14 => { k2 ^= (tail[13] as u64) << 40; k2 ^= (tail[12] as u64) << 32; k2 ^= (tail[11] as u64) << 24; k2 ^= (tail[10] as u64) << 16; k2 ^= (tail[9] as u64) << 8; k2 ^= tail[8] as u64; k2 = k2.wrapping_mul(C2); k2 = k2.rotate_left(33); k2 = k2.wrapping_mul(C1); h2 ^= k2; k1 ^= (tail[7] as u64) << 56; k1 ^= (tail[6] as u64) << 48; k1 ^= (tail[5] as u64) << 40; k1 ^= (tail[4] as u64) << 32; k1 ^= (tail[3] as u64) << 24; k1 ^= (tail[2] as u64) << 16; k1 ^= (tail[1] as u64) << 8; k1 ^= tail[0] as u64; k1 = k1.wrapping_mul(C1); k1 = k1.rotate_left(31); k1 = k1.wrapping_mul(C2); h1 ^= k1; }
+        13 => { k2 ^= (tail[12] as u64) << 32; k2 ^= (tail[11] as u64) << 24; k2 ^= (tail[10] as u64) << 16; k2 ^= (tail[9] as u64) << 8; k2 ^= tail[8] as u64; k2 = k2.wrapping_mul(C2); k2 = k2.rotate_left(33); k2 = k2.wrapping_mul(C1); h2 ^= k2; k1 ^= (tail[7] as u64) << 56; k1 ^= (tail[6] as u64) << 48; k1 ^= (tail[5] as u64) << 40; k1 ^= (tail[4] as u64) << 32; k1 ^= (tail[3] as u64) << 24; k1 ^= (tail[2] as u64) << 16; k1 ^= (tail[1] as u64) << 8; k1 ^= tail[0] as u64; k1 = k1.wrapping_mul(C1); k1 = k1.rotate_left(31); k1 = k1.wrapping_mul(C2); h1 ^= k1; }
+        12 => { k2 ^= (tail[11] as u64) << 24; k2 ^= (tail[10] as u64) << 16; k2 ^= (tail[9] as u64) << 8; k2 ^= tail[8] as u64; k2 = k2.wrapping_mul(C2); k2 = k2.rotate_left(33); k2 = k2.wrapping_mul(C1); h2 ^= k2; k1 ^= (tail[7] as u64) << 56; k1 ^= (tail[6] as u64) << 48; k1 ^= (tail[5] as u64) << 40; k1 ^= (tail[4] as u64) << 32; k1 ^= (tail[3] as u64) << 24; k1 ^= (tail[2] as u64) << 16; k1 ^= (tail[1] as u64) << 8; k1 ^= tail[0] as u64; k1 = k1.wrapping_mul(C1); k1 = k1.rotate_left(31); k1 = k1.wrapping_mul(C2); h1 ^= k1; }
+        11 => { k2 ^= (tail[10] as u64) << 16; k2 ^= (tail[9] as u64) << 8; k2 ^= tail[8] as u64; k2 = k2.wrapping_mul(C2); k2 = k2.rotate_left(33); k2 = k2.wrapping_mul(C1); h2 ^= k2; k1 ^= (tail[7] as u64) << 56; k1 ^= (tail[6] as u64) << 48; k1 ^= (tail[5] as u64) << 40; k1 ^= (tail[4] as u64) << 32; k1 ^= (tail[3] as u64) << 24; k1 ^= (tail[2] as u64) << 16; k1 ^= (tail[1] as u64) << 8; k1 ^= tail[0] as u64; k1 = k1.wrapping_mul(C1); k1 = k1.rotate_left(31); k1 = k1.wrapping_mul(C2); h1 ^= k1; }
+        10 => { k2 ^= (tail[9] as u64) << 8; k2 ^= tail[8] as u64; k2 = k2.wrapping_mul(C2); k2 = k2.rotate_left(33); k2 = k2.wrapping_mul(C1); h2 ^= k2; k1 ^= (tail[7] as u64) << 56; k1 ^= (tail[6] as u64) << 48; k1 ^= (tail[5] as u64) << 40; k1 ^= (tail[4] as u64) << 32; k1 ^= (tail[3] as u64) << 24; k1 ^= (tail[2] as u64) << 16; k1 ^= (tail[1] as u64) << 8; k1 ^= tail[0] as u64; k1 = k1.wrapping_mul(C1); k1 = k1.rotate_left(31); k1 = k1.wrapping_mul(C2); h1 ^= k1; }
+        9 => { k2 ^= tail[8] as u64; k2 = k2.wrapping_mul(C2); k2 = k2.rotate_left(33); k2 = k2.wrapping_mul(C1); h2 ^= k2; k1 ^= (tail[7] as u64) << 56; k1 ^= (tail[6] as u64) << 48; k1 ^= (tail[5] as u64) << 40; k1 ^= (tail[4] as u64) << 32; k1 ^= (tail[3] as u64) << 24; k1 ^= (tail[2] as u64) << 16; k1 ^= (tail[1] as u64) << 8; k1 ^= tail[0] as u64; k1 = k1.wrapping_mul(C1); k1 = k1.rotate_left(31); k1 = k1.wrapping_mul(C2); h1 ^= k1; }
+        8 => { k1 ^= (tail[7] as u64) << 56; k1 ^= (tail[6] as u64) << 48; k1 ^= (tail[5] as u64) << 40; k1 ^= (tail[4] as u64) << 32; k1 ^= (tail[3] as u64) << 24; k1 ^= (tail[2] as u64) << 16; k1 ^= (tail[1] as u64) << 8; k1 ^= tail[0] as u64; k1 = k1.wrapping_mul(C1); k1 = k1.rotate_left(31); k1 = k1.wrapping_mul(C2); h1 ^= k1; }
+        7 => { k1 ^= (tail[6] as u64) << 48; k1 ^= (tail[5] as u64) << 40; k1 ^= (tail[4] as u64) << 32; k1 ^= (tail[3] as u64) << 24; k1 ^= (tail[2] as u64) << 16; k1 ^= (tail[1] as u64) << 8; k1 ^= tail[0] as u64; k1 = k1.wrapping_mul(C1); k1 = k1.rotate_left(31); k1 = k1.wrapping_mul(C2); h1 ^= k1; }
+        6 => { k1 ^= (tail[5] as u64) << 40; k1 ^= (tail[4] as u64) << 32; k1 ^= (tail[3] as u64) << 24; k1 ^= (tail[2] as u64) << 16; k1 ^= (tail[1] as u64) << 8; k1 ^= tail[0] as u64; k1 = k1.wrapping_mul(C1); k1 = k1.rotate_left(31); k1 = k1.wrapping_mul(C2); h1 ^= k1; }
+        5 => { k1 ^= (tail[4] as u64) << 32; k1 ^= (tail[3] as u64) << 24; k1 ^= (tail[2] as u64) << 16; k1 ^= (tail[1] as u64) << 8; k1 ^= tail[0] as u64; k1 = k1.wrapping_mul(C1); k1 = k1.rotate_left(31); k1 = k1.wrapping_mul(C2); h1 ^= k1; }
+        4 => { k1 ^= (tail[3] as u64) << 24; k1 ^= (tail[2] as u64) << 16; k1 ^= (tail[1] as u64) << 8; k1 ^= tail[0] as u64; k1 = k1.wrapping_mul(C1); k1 = k1.rotate_left(31); k1 = k1.wrapping_mul(C2); h1 ^= k1; }
+        3 => { k1 ^= (tail[2] as u64) << 16; k1 ^= (tail[1] as u64) << 8; k1 ^= tail[0] as u64; k1 = k1.wrapping_mul(C1); k1 = k1.rotate_left(31); k1 = k1.wrapping_mul(C2); h1 ^= k1; }
+        2 => { k1 ^= (tail[1] as u64) << 8; k1 ^= tail[0] as u64; k1 = k1.wrapping_mul(C1); k1 = k1.rotate_left(31); k1 = k1.wrapping_mul(C2); h1 ^= k1; }
+        1 => { k1 ^= tail[0] as u64; k1 = k1.wrapping_mul(C1); k1 = k1.rotate_left(31); k1 = k1.wrapping_mul(C2); h1 ^= k1; }
+        _ => {}
+    }
+
+    // Finalization
+    h1 ^= len as u64;
+    h2 ^= len as u64;
+    h1 = h1.wrapping_add(h2);
+    h2 = h2.wrapping_add(h1);
+    h1 = fmix64(h1);
+    h2 = fmix64(h2);
+    h1 = h1.wrapping_add(h2);
+    h2 = h2.wrapping_add(h1);
+
+    (h1, h2)
+}
+
+#[inline]
+fn fmix64(mut k: u64) -> u64 {
+    k ^= k >> 33;
+    k = k.wrapping_mul(0xff51_afd7_ed55_8ccd);
+    k ^= k >> 33;
+    k = k.wrapping_mul(0xc4ce_b9fe_1a85_ec53);
+    k ^= k >> 33;
+    k
+}
 
 /// Generate four base hash values from key data using Murmur3.
 fn base_hashes(data: &[u8]) -> [u64; 4] {
-    let result1 = murmur3_x64_128(&mut &data[..], 0).unwrap_or(0);
-    let h1 = result1 as u64;
-    let h2 = (result1 >> 64) as u64;
+    let (h1, h2) = murmur3_x64_128(data, 0);
 
     let mut data_with_one: Vec<u8> = Vec::with_capacity(data.len() + 1);
     data_with_one.extend_from_slice(data);
     data_with_one.push(1);
 
-    let result2 = murmur3_x64_128(&mut &data_with_one[..], 0).unwrap_or(0);
-    let h3 = result2 as u64;
-    let h4 = (result2 >> 64) as u64;
+    let (h3, h4) = murmur3_x64_128(&data_with_one, 0);
 
     [h1, h2, h3, h4]
 }
