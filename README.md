@@ -137,7 +137,59 @@ yggdrasil-lite is transport-agnostic. It operates on framed byte streams — the
 - **Embassy**: `embassy-net::TcpSocket` + `embedded-tls`
 - **Any other runtime** that provides a byte stream
 
-See `examples/lite_node.rs` for a complete desktop integration with TLS, metadata handshake, and a userspace TCP/HTTP server running on the Yggdrasil overlay.
+## Examples
+
+### Desktop: `lite_node`
+
+A complete desktop integration test node with TLS, metadata handshake, and a userspace TCP/HTTP server running on the Yggdrasil overlay.
+
+```sh
+# 1. Start a yggdrasil-ng node
+cargo run -p yggdrasil -- --config yggdrasil.conf --loglevel debug
+# Note the TLS listen address (e.g. tls://0.0.0.0:2020)
+
+# 2. Run the lite node
+cargo run --example lite_node -p yggdrasil-lite -- 127.0.0.1:2020
+
+# 3. Test from the yggdrasil-ng host
+curl -6 --max-time 30 "http://[<lite_ipv6>]:80/hello"
+```
+
+### ESP32-C6: Yggdrasil TCP-UART Bridge
+
+A firmware for ESP32-C6 (tested on **ESP32-C6-WROOM-1**) that bridges TCP connections over the Yggdrasil mesh to a hardware UART. The device connects to WiFi, establishes a TLS connection to Yggdrasil peers, and listens for TCP and ICMPv6 on its overlay IPv6 address.
+
+See [`examples/esp32c6/`](examples/esp32c6/) for the full project. Quick start:
+
+```sh
+cd examples/esp32c6
+
+# Edit .cargo/config.toml with your WiFi and peer settings
+# Then build and flash:
+cargo run --release
+```
+
+On boot the device prints its Yggdrasil IPv6 address. You can then connect to it from anywhere on the mesh:
+
+```sh
+# Ping over Yggdrasil (via yggstack SOCKS5 proxy)
+ping6 -x 127.0.0.1:1080 <esp-ipv6>
+
+# TCP to UART bridge
+nc -X 5 -x 127.0.0.1:1080 <esp-ipv6> 2000
+```
+
+A web UI is available at `http://192.168.4.1` (connect to the `YggBridge` AP) for configuring WiFi credentials and Yggdrasil peer addresses.
+
+## End-to-End Test
+
+An automated E2E test verifies the full stack: yggstack → yggdrasil-ng → lite_node → HTTP.
+
+```sh
+YGGSTACK_BIN=/path/to/yggstack bash tests/e2e.sh
+```
+
+The test starts a yggstack node with a SOCKS5 proxy, connects a lite_node to it, and verifies HTTP reachability over the Yggdrasil overlay via curl.
 
 ## Building
 
@@ -146,8 +198,9 @@ See `examples/lite_node.rs` for a complete desktop integration with TLS, metadat
 cargo test
 cargo run --example lite_node -- 127.0.0.1:12345
 
-# Embedded (no_std) — e.g., ESP32-C6 RISC-V
-cargo build --target riscv32imac-unknown-none-elf --no-default-features
+# ESP32-C6 (no_std) — requires nightly toolchain
+cd examples/esp32c6
+cargo build --release
 ```
 
 ## License

@@ -1,0 +1,73 @@
+[package]
+name = "yggdrasil-uart-bridge"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+# Yggdrasil lite node (no_std mode)
+yggdrasil-lite = { path = "../..", default-features = false }
+
+# Embassy async runtime
+embassy-executor = "0.9.0"
+embassy-futures = "0.1"
+embassy-net = { version = "0.8.0", features = [
+    "dhcpv4",
+    "dns",
+    "medium-ethernet",
+    "tcp",
+    "udp",
+] }
+embassy-time = "0.5.0"
+embassy-sync = "0.7"
+embedded-io-async = "0.7"
+
+# ESP HAL
+esp-alloc = { path = "/Users/cleverfox/Projects/esp-hal/esp-alloc" }
+esp-backtrace = { path = "/Users/cleverfox/Projects/esp-hal/esp-backtrace", features = [
+    "panic-handler",
+    "println",
+] }
+esp-bootloader-esp-idf = { path = "/Users/cleverfox/Projects/esp-hal/esp-bootloader-esp-idf" }
+esp-hal = { path = "/Users/cleverfox/Projects/esp-hal/esp-hal", features = ["log-04", "unstable"] }
+esp-println = { path = "/Users/cleverfox/Projects/esp-hal/esp-println", features = ["log-04"] }
+esp-rtos = { path = "/Users/cleverfox/Projects/esp-hal/esp-rtos", features = ["esp-radio", "embassy", "log-04"] }
+esp-radio = { path = "/Users/cleverfox/Projects/esp-hal/esp-radio", features = [
+    "log-04",
+    "wifi",
+    "unstable",
+] }
+esp-storage = { path = "/Users/cleverfox/Projects/esp-hal/esp-storage" }
+embedded-storage = "0.3.1"
+
+# TLS
+embedded-tls = { version = "0.18", default-features = false }
+rand_core = { version = "0.6", default-features = false }
+
+# Crypto (must match yggdrasil-lite's ed25519-dalek version)
+ed25519-dalek = { version = "2", default-features = false }
+
+# Utils
+static_cell = "2.1.0"
+heapless = "0.8"
+log = "0.4"
+esp-hal-dhcp-server = "0.2"
+
+[features]
+default = ["esp32c6"]
+esp32c6 = [
+    "esp-backtrace/esp32c6",
+    "esp-bootloader-esp-idf/esp32c6",
+    "esp-hal/esp32c6",
+    "esp-rtos/esp32c6",
+    "esp-radio/esp32c6",
+    "esp-storage/esp32c6",
+]
+
+[profile.dev]
+opt-level = 2
+
+[profile.release]
+debug = true
+debug-assertions = true
+lto = "fat"
+codegen-units = 1
