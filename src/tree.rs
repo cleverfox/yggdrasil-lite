@@ -689,6 +689,13 @@ impl LeafTree {
         root
     }
 
+    /// Our direct parent peer key (from our own TreeInfo).
+    /// Returns `None` if we don't have tree info yet.
+    /// Returns our own key if we are self-rooted.
+    pub fn get_parent(&self) -> Option<PublicKey> {
+        self.get_info(&self.our_key).map(|info| info.parent)
+    }
+
     /// Get ancestry: list of keys from root down to `key`.
     fn get_ancestry(&self, key: &PublicKey) -> Vec<PublicKey> {
         let mut anc = Vec::new();

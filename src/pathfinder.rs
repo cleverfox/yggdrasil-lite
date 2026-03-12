@@ -145,6 +145,41 @@ impl LeafPathfinder {
             .map(|(_, e)| e.path.as_slice())
     }
 
+    /// Update or insert a path from an incoming traffic frame's `from` field.
+    /// This allows the lite node to learn return paths without a full PathNotify exchange.
+    pub fn update_path(&mut self, source: PublicKey, path: Vec<PeerPort>, now_ms: u64) {
+        if let Some(entry) = self.paths.iter_mut().find(|(k, _)| *k == source) {
+            entry.1.path = path;
+            entry.1.broken = false;
+            entry.1.refresh_tick = now_ms;
+            return;
+        }
+
+        // Evict oldest if at capacity
+        if self.paths.len() >= self.max_paths {
+            if let Some(pos) = self
+                .paths
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, (_, e))| e.refresh_tick)
+                .map(|(i, _)| i)
+            {
+                self.paths.swap_remove(pos);
+            }
+        }
+
+        self.paths.push((
+            source,
+            PathEntry {
+                path,
+                seq: 0,
+                req_tick: now_ms,
+                refresh_tick: now_ms,
+                broken: false,
+            },
+        ));
+    }
+
     /// Check if a path exists (even if broken).
     pub fn has_path(&self, dest: &PublicKey) -> bool {
         self.paths.iter().any(|(k, _)| k == dest)

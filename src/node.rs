@@ -70,6 +70,10 @@ pub enum NodeEvent {
 /// Interval for tree maintenance (SigReq, parent selection, announce).
 const TREE_INTERVAL_MS: u64 = 30_000;
 
+/// Interval for tree refresh (periodic re-announcement to prevent expiry).
+/// Must be less than the server's info expiry timeout (300s in ironwood).
+const TREE_REFRESH_INTERVAL_MS: u64 = 120_000;
+
 /// Interval for bloom maintenance.
 const BLOOM_INTERVAL_MS: u64 = 10_000;
 
@@ -80,7 +84,8 @@ const PATH_CLEANUP_INTERVAL_MS: u64 = 60_000;
 const SESSION_CLEANUP_INTERVAL_MS: u64 = 30_000;
 
 /// Interval for keepalive sends.
-const KEEPALIVE_INTERVAL_MS: u64 = 20_000;
+/// Must be less than the peer timeout (typically 3s in ironwood).
+const KEEPALIVE_INTERVAL_MS: u64 = 2_000;
 
 /// Path lookup timeout (how long before re-sending lookup).
 const PATH_TIMEOUT_MS: u64 = 60_000;
@@ -110,6 +115,7 @@ pub struct YggdrasilLite {
 
     // Timers (tick-based, ms)
     last_tree_tick: u64,
+    last_tree_refresh_tick: u64,
     last_bloom_tick: u64,
     last_path_cleanup_tick: u64,
     last_session_cleanup_tick: u64,
@@ -124,7 +130,7 @@ impl YggdrasilLite {
         let curve_priv = crypto::ed25519_private_to_curve25519(&crypto.signing_key);
 
         Self {
-            blooms: LeafBlooms::new(None),
+            blooms: LeafBlooms::new(Some(bloom_transform)),
             pathfinder: LeafPathfinder::with_capacity(
                 &crypto,
                 config.max_paths,
@@ -138,6 +144,7 @@ impl YggdrasilLite {
             password: config.password,
 
             last_tree_tick: 0,
+            last_tree_refresh_tick: 0,
             last_bloom_tick: 0,
             last_path_cleanup_tick: 0,
             last_session_cleanup_tick: 0,
@@ -352,7 +359,9 @@ impl YggdrasilLite {
 
         // After tree update, refresh our own path info and bloom parent
         self.update_own_path_info(now_ms);
-        self.blooms.set_parent(&self.tree.get_root());
+        if let Some(parent) = self.tree.get_parent() {
+            self.blooms.set_parent(&parent, &self.crypto.public_key);
+        }
 
         events
     }
@@ -378,13 +387,19 @@ impl YggdrasilLite {
 
         let mut events = Vec::new();
 
-        // Check if the lookup is for us
-        if lookup.dest == self.crypto.public_key {
-            // Respond with our path info via PathNotify
+        // Check if the lookup is for us.
+        // lookup.dest may be a partial key (from Address::get_key), so compare
+        // using the bloom transform rather than direct key equality.
+        let dest_xkey = bloom_transform(lookup.dest);
+        let our_xkey = bloom_transform(self.crypto.public_key);
+        if dest_xkey == our_xkey {
+            // Respond with our path info via PathNotify.
+            // path = requester's coordinates (for greedy tree routing back to them)
+            // info.path = our coordinates (the actual path info for the pathfinder cache)
             let our_coords = self.tree.get_coords();
             let notify = wire::PathNotify {
-                path: our_coords.clone(),
-                watermark: 0,
+                path: lookup.from.clone(),
+                watermark: u64::MAX,
                 source: self.crypto.public_key,
                 dest: lookup.source,
                 info: wire::PathNotifyInfo {
@@ -471,6 +486,16 @@ impl YggdrasilLite {
         // Only accept traffic destined for us
         if traffic.dest != self.crypto.public_key {
             return Vec::new();
+        }
+
+        // Cache the sender's coordinates from the traffic.from field
+        // so we can route responses back without needing a separate PathNotify
+        if !traffic.from.is_empty() {
+            self.pathfinder.update_path(
+                traffic.source,
+                traffic.from.clone(),
+                now_ms,
+            );
         }
 
         // Session-level handling
@@ -598,6 +623,14 @@ impl YggdrasilLite {
     ) -> Vec<NodeEvent> {
         let mut events = Vec::new();
 
+        // Periodic tree refresh to prevent announce expiry
+        if self.last_tree_refresh_tick > 0
+            && now_ms.saturating_sub(self.last_tree_refresh_tick) >= TREE_REFRESH_INTERVAL_MS
+        {
+            self.last_tree_refresh_tick = now_ms;
+            self.tree.set_needs_refresh();
+        }
+
         // Tree maintenance
         if now_ms.saturating_sub(self.last_tree_tick) >= TREE_INTERVAL_MS || self.last_tree_tick == 0
         {
@@ -607,8 +640,16 @@ impl YggdrasilLite {
             let actions = self.tree.do_maintenance(&self.crypto, &peers, nonce);
             events.extend(self.tree_actions_to_events(actions));
 
-            // Update own path info after tree changes
+            // Start refresh timer after first tree maintenance
+            if self.last_tree_refresh_tick == 0 {
+                self.last_tree_refresh_tick = now_ms;
+            }
+
+            // Update own path info and bloom parent after tree changes
             self.update_own_path_info(now_ms);
+            if let Some(parent) = self.tree.get_parent() {
+                self.blooms.set_parent(&parent, &self.crypto.public_key);
+            }
         }
 
         // Bloom maintenance
@@ -617,8 +658,8 @@ impl YggdrasilLite {
         {
             self.last_bloom_tick = now_ms;
             let bloom_updates = self.blooms.do_maintenance(&self.crypto.public_key);
-            for (target_key, filter) in bloom_updates {
-                if let Some(peer) = self.peers.get_by_key(&target_key) {
+            for (target_key, filter) in &bloom_updates {
+                if let Some(peer) = self.peers.get_by_key(target_key) {
                     let peer_id = peer.id;
                     let mut payload = Vec::new();
                     filter.encode(&mut payload);
@@ -751,7 +792,7 @@ impl YggdrasilLite {
                             from: self.tree.get_coords(),
                             source: self.crypto.public_key,
                             dest: *dest,
-                            watermark: 0,
+                            watermark: u64::MAX,
                             payload,
                         };
                         let mut traffic_payload = Vec::new();
@@ -774,7 +815,7 @@ impl YggdrasilLite {
             from: self.tree.get_coords(),
             source: self.crypto.public_key,
             dest: *dest,
-            watermark: 0,
+            watermark: u64::MAX,
             payload,
         };
         let mut traffic_payload = Vec::new();
@@ -848,6 +889,13 @@ impl YggdrasilLite {
     pub fn get_peer(&self, peer_id: PeerId) -> Option<&PeerState> {
         self.peers.get(peer_id)
     }
+}
+
+/// Bloom transform: `subnet_for_key(key).get_key()`.
+/// Must match the transform used by ironwood in the full node.
+fn bloom_transform(key: PublicKey) -> PublicKey {
+    let subnet = address::subnet_for_key(&key);
+    subnet.get_key()
 }
 
 /// Generate a random nonce from the RNG.

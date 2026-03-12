@@ -184,10 +184,13 @@ impl LeafBlooms {
         }
     }
 
-    /// Update on-tree status. For a leaf node, only the parent is on-tree.
-    pub fn set_parent(&mut self, parent_key: &PublicKey) {
+    /// Update on-tree status based on tree parent.
+    /// When we have a parent peer: only that peer is on-tree.
+    /// When we are root (parent == our_key): all peers are children → all on-tree.
+    pub fn set_parent(&mut self, parent_key: &PublicKey, our_key: &PublicKey) {
+        let is_root = parent_key == our_key;
         for (k, info) in &mut self.peers {
-            info.on_tree = k == parent_key;
+            info.on_tree = k == parent_key || is_root;
         }
     }
 
