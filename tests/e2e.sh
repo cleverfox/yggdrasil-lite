@@ -6,6 +6,10 @@
 # the lite_node example to it, and verifies HTTP reachability over the
 # Yggdrasil overlay via curl through the SOCKS5 proxy.
 #
+# Uses pre-generated test keys (lite_node pub < yggstack pub) to ensure
+# deterministic tree root selection and avoid the ~24s bloom filter delay.
+# If key files don't exist, they are generated automatically.
+#
 # Required:
 #   YGGSTACK_BIN  — path to the yggstack binary
 #
@@ -63,14 +67,40 @@ extract_match() {
     echo "$result" | head -1
 }
 
-# ── 1. Generate yggstack config ──────────────────────────────────────
+# ── 0. Ensure test keys exist ─────────────────────────────────────────
+KEYS_DIR="$SCRIPT_DIR/keys"
+LITE_SEED_FILE="$KEYS_DIR/lite_node.seed"
+YGGSTACK_KEY_FILE="$KEYS_DIR/yggstack.key"
+
+if [[ ! -f "$LITE_SEED_FILE" ]] || [[ ! -f "$YGGSTACK_KEY_FILE" ]]; then
+    info "Test keys not found, generating (lite_node pub < yggstack pub)..."
+    cargo run --example gen_test_keys --manifest-path "$CRATE_DIR/Cargo.toml" 2>&1 \
+        || fail "Failed to generate test keys"
+fi
+
+LITE_SEED="$(cat "$LITE_SEED_FILE")"
+YGGSTACK_KEY="$(cat "$YGGSTACK_KEY_FILE")"
+[[ -n "$LITE_SEED" ]] || fail "Empty lite_node seed in $LITE_SEED_FILE"
+[[ -n "$YGGSTACK_KEY" ]] || fail "Empty yggstack key in $YGGSTACK_KEY_FILE"
+info "Using stored test keys (lite_node pub < yggstack pub)"
+
+# ── 1. Generate yggstack config with stored key ───────────────────────
 info "Generating yggstack config"
-# Use --genconf for a valid keypair, then replace the Listen address
+# Use --genconf for a valid config template, then inject our stored key
+# and switch the listener to TLS on localhost
 "$YGGSTACK_BIN" --genconf 2>/dev/null \
     | sed 's|"tcp://0.0.0.0:0"|"tls://127.0.0.1:0"|' \
+    | sed "s|\"PrivateKey\": \"[a-fA-F0-9]*\"|\"PrivateKey\": \"${YGGSTACK_KEY}\"|" \
     > "$WORKDIR/yggstack.conf"
 
 [[ -s "$WORKDIR/yggstack.conf" ]] || fail "Failed to generate yggstack config"
+
+# Verify the key was injected (check first 32 chars to avoid line-length issues)
+if ! grep -q "${YGGSTACK_KEY:0:32}" "$WORKDIR/yggstack.conf"; then
+    echo "--- Generated config ---"
+    cat "$WORKDIR/yggstack.conf"
+    fail "Failed to inject yggstack key into config"
+fi
 
 # ── 2. Start yggstack ────────────────────────────────────────────────
 info "Starting yggstack (SOCKS5 on 127.0.0.1:$SOCKS_PORT)"
@@ -92,8 +122,8 @@ info "yggstack TLS listener at $TLS_ADDR"
 info "Building lite_node example"
 cargo build --example lite_node --manifest-path "$CRATE_DIR/Cargo.toml" 2>&1 || fail "Failed to build lite_node"
 
-info "Starting lite_node (peer: $TLS_ADDR)"
-cargo run --example lite_node --manifest-path "$CRATE_DIR/Cargo.toml" -- "$TLS_ADDR" \
+info "Starting lite_node (peer: $TLS_ADDR, seed: ${LITE_SEED:0:8}...)"
+cargo run --example lite_node --manifest-path "$CRATE_DIR/Cargo.toml" -- "$TLS_ADDR" --seed "$LITE_SEED" \
     > "$WORKDIR/lite_node.log" 2>&1 &
 LITE_PID=$!
 
@@ -119,7 +149,7 @@ while [[ $ELAPSED -lt $TEST_TIMEOUT ]]; do
     kill -0 "$YGGSTACK_PID" 2>/dev/null || fail "yggstack died (check $WORKDIR/yggstack.log)"
     kill -0 "$LITE_PID" 2>/dev/null || fail "lite_node died (check $WORKDIR/lite_node.log)"
 
-    RESPONSE="$(curl -6 -s --socks5-hostname "127.0.0.1:$SOCKS_PORT" \
+    RESPONSE="$(curl -s --socks5-hostname "127.0.0.1:$SOCKS_PORT" \
         --max-time "$CURL_ATTEMPT_TIMEOUT" \
         "http://[$LITE_IPV6]:80/hello" 2>&1)" || true
 

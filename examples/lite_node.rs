@@ -627,19 +627,36 @@ fn get_dest_key_from_ipv6(pkt: &[u8], map: &HashMap<Ipv6Addr, PublicKey>) -> Opt
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
-        eprintln!("Usage: {} <peer_addr:port>", args[0]);
+        eprintln!("Usage: {} <peer_addr:port> [--seed <hex_seed>]", args[0]);
         eprintln!();
         eprintln!("Connects to a yggdrasil-ng node and serves HTTP on the overlay.");
         eprintln!();
+        eprintln!("Options:");
+        eprintln!("  --seed <hex>  Use a specific 32-byte Ed25519 seed (64 hex chars)");
+        eprintln!();
         eprintln!("Example:");
         eprintln!("  {} 127.0.0.1:12345", args[0]);
+        eprintln!("  {} 127.0.0.1:12345 --seed abcdef0123...", args[0]);
         std::process::exit(1);
     }
     let peer_addr = &args[1];
 
-    // ── Generate Ed25519 keypair ──────────────────────────────────────────
+    // ── Generate or load Ed25519 keypair ─────────────────────────────────
     let mut seed = [0u8; 32];
-    OsRng.fill_bytes(&mut seed);
+    if let Some(pos) = args.iter().position(|a| a == "--seed") {
+        if let Some(hex_str) = args.get(pos + 1) {
+            let bytes = hex::decode(hex_str).expect("invalid hex seed");
+            assert_eq!(bytes.len(), 32, "seed must be 32 bytes (64 hex chars)");
+            seed.copy_from_slice(&bytes);
+            eprintln!("[KEY] Using provided seed");
+        } else {
+            eprintln!("--seed requires a hex argument");
+            std::process::exit(1);
+        }
+    } else {
+        OsRng.fill_bytes(&mut seed);
+        eprintln!("[KEY] Generated random seed");
+    }
     let signing_key = SigningKey::from_bytes(&seed);
     let public_key: PublicKey = signing_key.verifying_key().to_bytes();
 
