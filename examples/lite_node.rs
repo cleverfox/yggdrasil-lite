@@ -52,12 +52,17 @@ const TYPE_SESSION_TRAFFIC: u8 = 0x01;
 /// HTTP response body.
 const HTTP_BODY: &[u8] = b"Hello, World!\n";
 
-/// TCP flags.
-const TCP_FIN: u8 = 0x01;
-const TCP_SYN: u8 = 0x02;
-const TCP_RST: u8 = 0x04;
-const TCP_PSH: u8 = 0x08;
-const TCP_ACK: u8 = 0x10;
+#[cfg(not(feature = "smoltcp"))]
+mod minitcp_consts {
+    /// TCP flags.
+    pub const TCP_FIN: u8 = 0x01;
+    pub const TCP_SYN: u8 = 0x02;
+    pub const TCP_RST: u8 = 0x04;
+    pub const TCP_PSH: u8 = 0x08;
+    pub const TCP_ACK: u8 = 0x10;
+}
+#[cfg(not(feature = "smoltcp"))]
+use minitcp_consts::*;
 
 /// Our HTTP listen port.
 const HTTP_PORT: u16 = 80;
@@ -140,6 +145,7 @@ fn complete_tls_handshake(
 // Minimal userspace IPv6 + TCP stack (just enough for one HTTP req/res)
 // ============================================================================
 
+#[cfg(not(feature = "smoltcp"))]
 /// Parsed IPv6 header (always 40 bytes, no extensions supported).
 #[allow(dead_code)]
 struct Ipv6Header {
@@ -150,6 +156,7 @@ struct Ipv6Header {
     hop_limit: u8,
 }
 
+#[cfg(not(feature = "smoltcp"))]
 /// Parsed TCP header.
 #[allow(dead_code)]
 struct TcpHeader {
@@ -162,6 +169,7 @@ struct TcpHeader {
     window: u16,
 }
 
+#[cfg(not(feature = "smoltcp"))]
 fn parse_ipv6(data: &[u8]) -> Option<(Ipv6Header, &[u8])> {
     if data.len() < 40 {
         return None;
@@ -193,6 +201,7 @@ fn parse_ipv6(data: &[u8]) -> Option<(Ipv6Header, &[u8])> {
     ))
 }
 
+#[cfg(not(feature = "smoltcp"))]
 fn parse_tcp(data: &[u8]) -> Option<(TcpHeader, &[u8])> {
     if data.len() < 20 {
         return None;
@@ -222,6 +231,7 @@ fn parse_tcp(data: &[u8]) -> Option<(TcpHeader, &[u8])> {
     ))
 }
 
+#[cfg(not(feature = "smoltcp"))]
 /// Compute TCP checksum with IPv6 pseudo-header.
 fn tcp_checksum_ipv6(src: &[u8; 16], dst: &[u8; 16], tcp_segment: &[u8]) -> u16 {
     let mut sum: u32 = 0;
@@ -260,6 +270,7 @@ fn tcp_checksum_ipv6(src: &[u8; 16], dst: &[u8; 16], tcp_segment: &[u8]) -> u16 
     !(sum as u16)
 }
 
+#[cfg(not(feature = "smoltcp"))]
 /// Build an IPv6+TCP response packet.
 fn build_ipv6_tcp(
     src_addr: &[u8; 16],
@@ -326,6 +337,7 @@ fn build_ipv6_tcp(
 // Mini TCP connection state machine
 // ============================================================================
 
+#[cfg(not(feature = "smoltcp"))]
 #[derive(Debug, Clone, Copy, PartialEq)]
 #[allow(dead_code)]
 enum TcpState {
@@ -337,6 +349,7 @@ enum TcpState {
     Closed,
 }
 
+#[cfg(not(feature = "smoltcp"))]
 struct MiniTcp {
     our_addr: [u8; 16],
     state: TcpState,
@@ -351,6 +364,7 @@ struct MiniTcp {
     http_buf: Vec<u8>,
 }
 
+#[cfg(not(feature = "smoltcp"))]
 impl MiniTcp {
     fn new(our_addr: [u8; 16], listen_port: u16) -> Self {
         let mut isn = [0u8; 4];
@@ -621,6 +635,88 @@ fn get_dest_key_from_ipv6(pkt: &[u8], map: &HashMap<Ipv6Addr, PublicKey>) -> Opt
 }
 
 // ============================================================================
+// smoltcp Device implementation
+// ============================================================================
+
+#[cfg(feature = "smoltcp")]
+mod ygg_device {
+    use std::collections::VecDeque;
+
+    use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
+    use smoltcp::time::Instant as SmolInstant;
+
+    pub struct YggDevice {
+        rx_queue: VecDeque<Vec<u8>>,
+        tx_queue: VecDeque<Vec<u8>>,
+    }
+
+    impl YggDevice {
+        pub fn new() -> Self {
+            Self {
+                rx_queue: VecDeque::new(),
+                tx_queue: VecDeque::new(),
+            }
+        }
+
+        /// Enqueue an inbound IPv6 packet (from Yggdrasil Deliver event).
+        pub fn push_rx(&mut self, pkt: Vec<u8>) {
+            self.rx_queue.push_back(pkt);
+        }
+
+        /// Drain all outbound packets (to send via Yggdrasil).
+        pub fn drain_tx(&mut self) -> impl Iterator<Item = Vec<u8>> + '_ {
+            self.tx_queue.drain(..)
+        }
+    }
+
+    pub struct YggRxToken(Vec<u8>);
+
+    impl RxToken for YggRxToken {
+        fn consume<R, F: FnOnce(&[u8]) -> R>(self, f: F) -> R {
+            f(&self.0)
+        }
+    }
+
+    pub struct YggTxToken<'a>(&'a mut VecDeque<Vec<u8>>);
+
+    impl<'a> TxToken for YggTxToken<'a> {
+        fn consume<R, F: FnOnce(&mut [u8]) -> R>(self, len: usize, f: F) -> R {
+            let mut buf = vec![0u8; len];
+            let r = f(&mut buf);
+            self.0.push_back(buf);
+            r
+        }
+    }
+
+    impl Device for YggDevice {
+        type RxToken<'a> = YggRxToken;
+        type TxToken<'a> = YggTxToken<'a>;
+
+        fn receive(
+            &mut self,
+            _timestamp: SmolInstant,
+        ) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
+            let data = self.rx_queue.pop_front()?;
+            Some((YggRxToken(data), YggTxToken(&mut self.tx_queue)))
+        }
+
+        fn transmit(&mut self, _timestamp: SmolInstant) -> Option<Self::TxToken<'_>> {
+            Some(YggTxToken(&mut self.tx_queue))
+        }
+
+        fn capabilities(&self) -> DeviceCapabilities {
+            let mut caps = DeviceCapabilities::default();
+            caps.max_transmission_unit = 65535;
+            caps.medium = Medium::Ip;
+            caps
+        }
+    }
+}
+
+#[cfg(feature = "smoltcp")]
+use ygg_device::YggDevice;
+
+// ============================================================================
 // Main
 // ============================================================================
 
@@ -773,9 +869,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ── Switch to non-blocking for the event loop ────────────────────────
     tcp.set_nonblocking(true)?;
 
-    // ── Set up mini TCP/IPv6 stack ───────────────────────────────────────
-    let mut mini_tcp = MiniTcp::new(our_addr.0, HTTP_PORT);
-
     // IPv6 → PublicKey routing table (built from received packets)
     let mut addr_to_key: HashMap<Ipv6Addr, PublicKey> = HashMap::new();
 
@@ -825,113 +918,387 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     eprintln!();
 
     // ── Event loop ───────────────────────────────────────────────────────
-    let start = Instant::now();
-    let mut last_poll: u64 = 0;
-    let mut last_status: u64 = 0;
-    let mut tls_read_buf = vec![0u8; 65536];
 
-    loop {
-        let now_ms = start.elapsed().as_millis() as u64;
-        let mut did_work = false;
+    #[cfg(not(feature = "smoltcp"))]
+    {
+        let mut mini_tcp = MiniTcp::new(our_addr.0, HTTP_PORT);
+        let start = Instant::now();
+        let mut last_poll: u64 = 0;
+        let mut last_status: u64 = 0;
+        let mut tls_read_buf = vec![0u8; 65536];
 
-        // ── 1. Read new TLS records from TCP ─────────────────────────────
-        match tls.read_tls(&mut tcp) {
-            Ok(0) => {
-                eprintln!("[CONN] Peer disconnected (EOF)");
-                break;
+        loop {
+            let now_ms = start.elapsed().as_millis() as u64;
+            let mut did_work = false;
+
+            // ── 1. Read new TLS records from TCP
+            match tls.read_tls(&mut tcp) {
+                Ok(0) => {
+                    eprintln!("[CONN] Peer disconnected (EOF)");
+                    break;
+                }
+                Ok(_n) => {
+                    match tls.process_new_packets() {
+                        Ok(_) => {}
+                        Err(e) => {
+                            eprintln!("[TLS] Error: {}", e);
+                            break;
+                        }
+                    }
+                }
+                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {}
+                Err(e) => {
+                    eprintln!("[CONN] Read error: {}", e);
+                    break;
+                }
             }
-            Ok(_n) => {
-                match tls.process_new_packets() {
+
+            // ── 2. Consume decrypted data from TLS reader
+            loop {
+                match tls.reader().read(&mut tls_read_buf) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        let events = node.handle_peer_data(
+                            peer_id,
+                            &tls_read_buf[..n],
+                            now_ms,
+                            &mut OsRng,
+                        );
+                        process_events(
+                            &events,
+                            &mut tls,
+                            &mut tcp,
+                            &mut mini_tcp,
+                            &mut addr_to_key,
+                            &mut node,
+                            now_ms,
+                        );
+                        did_work = true;
+                    }
+                    Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                    Err(_) => break,
+                }
+            }
+
+            // ── 3. Periodic node poll
+            if now_ms.saturating_sub(last_poll) >= 100 {
+                last_poll = now_ms;
+                let events = node.poll(now_ms, &mut OsRng);
+                if !events.is_empty() {
+                    for ev in &events {
+                        if let NodeEvent::SendToPeer { data, .. } = ev {
+                            let _ = tls.writer().write_all(data);
+                        }
+                    }
+                    did_work = true;
+                }
+            }
+
+            // ── 4. Flush TLS write buffer
+            while tls.wants_write() {
+                match tls.write_tls(&mut tcp) {
                     Ok(_) => {}
+                    Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => break,
                     Err(e) => {
-                        eprintln!("[TLS] Error: {}", e);
+                        eprintln!("[TLS] Write error: {}", e);
                         break;
                     }
                 }
             }
-            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {}
-            Err(e) => {
-                eprintln!("[CONN] Read error: {}", e);
-                break;
+
+            // ── 5. Status output
+            if now_ms.saturating_sub(last_status) >= 30_000 {
+                last_status = now_ms;
+                eprintln!(
+                    "[STATUS] uptime={}s peers={} sessions={} paths={} routes={}",
+                    now_ms / 1000,
+                    node.peer_count(),
+                    node.session_count(),
+                    node.path_count(),
+                    addr_to_key.len(),
+                );
+            }
+
+            if !did_work {
+                std::thread::sleep(Duration::from_millis(10));
             }
         }
+    }
 
-        // ── 2. Consume all available decrypted data from TLS reader ──────
-        // This runs regardless of whether read_tls produced new data,
-        // since the TLS reader may have buffered data from earlier.
+    #[cfg(feature = "smoltcp")]
+    {
+        use smoltcp::iface::{Config as IfaceConfig, Interface, SocketSet, SocketStorage};
+        use smoltcp::socket::tcp;
+        use smoltcp::time::Instant as SmolInstant;
+        use smoltcp::wire::{HardwareAddress, IpCidr, Ipv6Address};
+
+        let mut device = YggDevice::new();
+
+        // Configure smoltcp interface
+        let mut config = IfaceConfig::new(HardwareAddress::Ip);
+        config.random_seed = rand::random();
+
+        let mut iface = Interface::new(config, &mut device, SmolInstant::now());
+
+        // Set our Yggdrasil IPv6 address with /7 prefix
+        let local_ip = Ipv6Address::from(our_addr.0);
+        iface.update_ip_addrs(|addrs| {
+            addrs.push(IpCidr::new(local_ip.into(), 7)).unwrap();
+        });
+
+        // Create TCP socket with 4KB buffers
+        let tcp_rx_buf = tcp::SocketBuffer::new(vec![0u8; 4096]);
+        let tcp_tx_buf = tcp::SocketBuffer::new(vec![0u8; 4096]);
+        let tcp_socket = tcp::Socket::new(tcp_rx_buf, tcp_tx_buf);
+
+        let mut socket_storage = [SocketStorage::EMPTY];
+        let mut sockets = SocketSet::new(&mut socket_storage[..]);
+        let tcp_handle = sockets.add(tcp_socket);
+
+        // Start listening
+        sockets
+            .get_mut::<tcp::Socket>(tcp_handle)
+            .listen(HTTP_PORT)
+            .unwrap();
+        eprintln!("[SMOL] TCP listening on port {}", HTTP_PORT);
+
+        let start = Instant::now();
+        let mut last_poll: u64 = 0;
+        let mut last_status: u64 = 0;
+        let mut tls_read_buf = vec![0u8; 65536];
+        let mut http_buf: Vec<u8> = Vec::new();
+
         loop {
-            match tls.reader().read(&mut tls_read_buf) {
-                Ok(0) => break,
-                Ok(n) => {
-                    let events = node.handle_peer_data(
-                        peer_id,
-                        &tls_read_buf[..n],
-                        now_ms,
-                        &mut OsRng,
-                    );
-                    process_events(
-                        &events,
-                        &mut tls,
-                        &mut tcp,
-                        &mut mini_tcp,
-                        &mut addr_to_key,
-                        &mut node,
-                        now_ms,
-                    );
-                    did_work = true;
-                }
-                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => break,
-                Err(_) => break,
-            }
-        }
+            let now_ms = start.elapsed().as_millis() as u64;
+            let smol_now = SmolInstant::now();
+            let mut did_work = false;
 
-        // ── 3. Periodic node poll ────────────────────────────────────────
-        if now_ms.saturating_sub(last_poll) >= 100 {
-            last_poll = now_ms;
-            let events = node.poll(now_ms, &mut OsRng);
-            if !events.is_empty() {
-                for ev in &events {
-                    if let NodeEvent::SendToPeer { data, .. } = ev {
-                        let _ = tls.writer().write_all(data);
+            // ── 1. Read new TLS records from TCP
+            match tls.read_tls(&mut tcp) {
+                Ok(0) => {
+                    eprintln!("[CONN] Peer disconnected (EOF)");
+                    break;
+                }
+                Ok(_n) => {
+                    match tls.process_new_packets() {
+                        Ok(_) => {}
+                        Err(e) => {
+                            eprintln!("[TLS] Error: {}", e);
+                            break;
+                        }
                     }
                 }
-                did_work = true;
-            }
-        }
-
-        // ── 4. Flush TLS write buffer ────────────────────────────────────
-        while tls.wants_write() {
-            match tls.write_tls(&mut tcp) {
-                Ok(_) => {}
-                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {}
                 Err(e) => {
-                    eprintln!("[TLS] Write error: {}", e);
+                    eprintln!("[CONN] Read error: {}", e);
                     break;
                 }
             }
-        }
 
-        // ── 5. Status output ─────────────────────────────────────────────
-        if now_ms.saturating_sub(last_status) >= 30_000 {
-            last_status = now_ms;
-            eprintln!(
-                "[STATUS] uptime={}s peers={} sessions={} paths={} routes={}",
-                now_ms / 1000,
-                node.peer_count(),
-                node.session_count(),
-                node.path_count(),
-                addr_to_key.len(),
-            );
-        }
+            // ── 2. Consume decrypted data → route events
+            loop {
+                match tls.reader().read(&mut tls_read_buf) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        let events = node.handle_peer_data(
+                            peer_id,
+                            &tls_read_buf[..n],
+                            now_ms,
+                            &mut OsRng,
+                        );
+                        for event in &events {
+                            match event {
+                                NodeEvent::SendToPeer { data, .. } => {
+                                    let _ = tls.writer().write_all(data);
+                                    while tls.wants_write() {
+                                        match tls.write_tls(&mut tcp) {
+                                            Ok(_) => {}
+                                            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                                            Err(_) => break,
+                                        }
+                                    }
+                                }
+                                NodeEvent::Deliver { source, data } => {
+                                    if data.len() > 1 && data[0] == TYPE_SESSION_TRAFFIC {
+                                        let ipv6_packet = &data[1..];
 
-        if !did_work {
-            std::thread::sleep(Duration::from_millis(10));
+                                        // Record source key → IPv6 mapping
+                                        let source_addr = addr_for_key(source);
+                                        let source_ipv6 = bytes_to_ipv6(&source_addr.0);
+                                        addr_to_key.insert(source_ipv6, *source);
+
+                                        eprintln!(
+                                            "[RECV] {} bytes from {}",
+                                            ipv6_packet.len(),
+                                            source_ipv6
+                                        );
+
+                                        // Feed to smoltcp — ICMPv6 handled automatically
+                                        device.push_rx(ipv6_packet.to_vec());
+                                    } else if !data.is_empty() {
+                                        eprintln!(
+                                            "[RECV] Non-traffic data ({} bytes, type=0x{:02x})",
+                                            data.len(),
+                                            data[0]
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                        did_work = true;
+                    }
+                    Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                    Err(_) => break,
+                }
+            }
+
+            // ── 3. smoltcp poll (processes rx, generates tx)
+            iface.poll(smol_now, &mut device, &mut sockets);
+
+            // ── 4. Drain outbound packets → send via Yggdrasil
+            for pkt in device.drain_tx() {
+                if let Some(dest_key) = get_dest_key_from_ipv6(&pkt, &addr_to_key) {
+                    let mut payload = Vec::with_capacity(1 + pkt.len());
+                    payload.push(TYPE_SESSION_TRAFFIC);
+                    payload.extend_from_slice(&pkt);
+
+                    let send_events = node.send(&dest_key, &payload, now_ms, &mut OsRng);
+                    for sev in &send_events {
+                        if let NodeEvent::SendToPeer { data, .. } = sev {
+                            let _ = tls.writer().write_all(data);
+                            while tls.wants_write() {
+                                match tls.write_tls(&mut tcp) {
+                                    Ok(_) => {}
+                                    Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                                    Err(_) => break,
+                                }
+                            }
+                        }
+                    }
+                    did_work = true;
+                }
+            }
+
+            // ── 5. HTTP serving on TCP socket
+            {
+                let socket = sockets.get_mut::<tcp::Socket>(tcp_handle);
+
+                // Read incoming data
+                if socket.can_recv() {
+                    let mut tmp = [0u8; 1024];
+                    if let Ok(n) = socket.recv_slice(&mut tmp) {
+                        if n > 0 {
+                            http_buf.extend_from_slice(&tmp[..n]);
+                        }
+                    }
+                }
+
+                // Check if HTTP request is complete
+                if http_buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                    let req = String::from_utf8_lossy(&http_buf);
+                    if let Some(line) = req.lines().next() {
+                        eprintln!("[HTTP] {}", line);
+                    }
+
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\n\
+                         Content-Type: text/plain\r\n\
+                         Content-Length: {}\r\n\
+                         Connection: close\r\n\
+                         \r\n",
+                        HTTP_BODY.len()
+                    );
+                    let _ = socket.send_slice(response.as_bytes());
+                    let _ = socket.send_slice(HTTP_BODY);
+                    socket.close(); // initiate FIN
+                    http_buf.clear();
+                    eprintln!("[HTTP] Sent response");
+                    did_work = true;
+                }
+
+                // Re-listen when connection fully closed
+                if !socket.is_active() && !socket.is_listening() {
+                    socket.abort();
+                    let _ = socket.listen(HTTP_PORT);
+                }
+            }
+
+            // ── 6. Second smoltcp poll (flushes TCP responses)
+            iface.poll(smol_now, &mut device, &mut sockets);
+
+            // Drain tx again after second poll
+            for pkt in device.drain_tx() {
+                if let Some(dest_key) = get_dest_key_from_ipv6(&pkt, &addr_to_key) {
+                    let mut payload = Vec::with_capacity(1 + pkt.len());
+                    payload.push(TYPE_SESSION_TRAFFIC);
+                    payload.extend_from_slice(&pkt);
+
+                    let send_events = node.send(&dest_key, &payload, now_ms, &mut OsRng);
+                    for sev in &send_events {
+                        if let NodeEvent::SendToPeer { data, .. } = sev {
+                            let _ = tls.writer().write_all(data);
+                            while tls.wants_write() {
+                                match tls.write_tls(&mut tcp) {
+                                    Ok(_) => {}
+                                    Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                                    Err(_) => break,
+                                }
+                            }
+                        }
+                    }
+                    did_work = true;
+                }
+            }
+
+            // ── 7. Periodic node poll
+            if now_ms.saturating_sub(last_poll) >= 100 {
+                last_poll = now_ms;
+                let events = node.poll(now_ms, &mut OsRng);
+                if !events.is_empty() {
+                    for ev in &events {
+                        if let NodeEvent::SendToPeer { data, .. } = ev {
+                            let _ = tls.writer().write_all(data);
+                        }
+                    }
+                    did_work = true;
+                }
+            }
+
+            // ── 8. Flush TLS write buffer
+            while tls.wants_write() {
+                match tls.write_tls(&mut tcp) {
+                    Ok(_) => {}
+                    Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                    Err(e) => {
+                        eprintln!("[TLS] Write error: {}", e);
+                        break;
+                    }
+                }
+            }
+
+            // ── 9. Status output
+            if now_ms.saturating_sub(last_status) >= 30_000 {
+                last_status = now_ms;
+                eprintln!(
+                    "[STATUS] uptime={}s peers={} sessions={} paths={} routes={}",
+                    now_ms / 1000,
+                    node.peer_count(),
+                    node.session_count(),
+                    node.path_count(),
+                    addr_to_key.len(),
+                );
+            }
+
+            if !did_work {
+                std::thread::sleep(Duration::from_millis(10));
+            }
         }
     }
 
     Ok(())
 }
 
+#[cfg(not(feature = "smoltcp"))]
 /// Process node events: send frames to TLS, deliver IPv6 packets to mini TCP.
 fn process_events(
     events: &[NodeEvent],

@@ -13,9 +13,19 @@ sha2 = { version = "0.10", default-features = false }
 blake2 = { version = "0.10", default-features = false }
 rand_core = { version = "0.6", default-features = false }
 
+# TCP/IP stack (optional, replaces hand-rolled MiniTcp in lite_node example)
+smoltcp = { version = "0.12", optional = true, default-features = false, features = [
+    "std",
+    "alloc",
+    "proto-ipv6",
+    "socket-tcp",
+    "medium-ip",
+] }
+
 [features]
 default = ["std"]
 std = []
+smoltcp = ["dep:smoltcp"]
 
 [dev-dependencies]
 rand = "0.8"

@@ -120,7 +120,7 @@ info "yggstack TLS listener at $TLS_ADDR"
 
 # ── 3. Build and start lite_node ─────────────────────────────────────
 info "Building lite_node example"
-cargo build --example lite_node --manifest-path "$CRATE_DIR/Cargo.toml" 2>&1 || fail "Failed to build lite_node"
+cargo build --example lite_node -F smoltcp --manifest-path "$CRATE_DIR/Cargo.toml" 2>&1 || fail "Failed to build lite_node"
 
 info "Starting lite_node (peer: $TLS_ADDR, seed: ${LITE_SEED:0:8}...)"
 cargo run --example lite_node --manifest-path "$CRATE_DIR/Cargo.toml" -- "$TLS_ADDR" --seed "$LITE_SEED" \
