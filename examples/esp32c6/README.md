@@ -106,6 +106,37 @@ Settings are saved to flash. Reboot the device after changing configuration.
 | `/api/wifi` | POST | Set WiFi credentials (form: `ssid=...&password=...`) |
 | `/api/ygg/peers` | POST | Set peers (form: `peer1=...&peer2=...&peer3=...`) |
 
+## TCP Stack: MiniTcpUart vs smoltcp
+
+By default the firmware uses `MiniTcpUart` — a minimal hand-rolled TCP state machine (~200 lines) with manual ICMPv6 echo reply handling. An optional `smoltcp` feature replaces it with the [smoltcp](https://github.com/smoltcp-rs/smoltcp) TCP/IP stack.
+
+```sh
+# Default build (MiniTcpUart)
+cargo run --release
+
+# Build with smoltcp
+cargo run --release --features smoltcp
+```
+
+### MiniTcpUart (default)
+
+- Single TCP connection, basic 3-way handshake and teardown
+- Manual ICMPv6 echo reply (ping)
+- No congestion control or TCP windowing
+- ~0 KB heap overhead (all state on stack)
+- Good enough for a single UART bridge session
+
+### smoltcp (`--features smoltcp`)
+
+- Full TCP implementation (windowing, retransmission, congestion control)
+- Automatic ICMPv6 handling (echo, unreachable, etc.)
+- Proper socket state machine with re-listen after close
+- ~4 KB extra heap (2 x 1 KB socket buffers + interface state)
+- Requires 96 KB heap (vs 72 KB for MiniTcpUart)
+- More robust under packet loss or misbehaving peers
+
+Enable smoltcp if you need reliable TCP behavior or plan to extend the firmware beyond simple UART bridging. Stick with the default if heap is tight or you only need a single clean connection.
+
 ## Flash Layout (NVS)
 
 | Offset | Size | Contents |

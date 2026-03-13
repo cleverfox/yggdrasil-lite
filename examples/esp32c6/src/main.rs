@@ -86,17 +86,22 @@ const YGG_PEERS_OFFSET: u32 = 256; // 256 bytes for 3 peers
 /// Session type byte prepended to IPv6 packets.
 const TYPE_SESSION_TRAFFIC: u8 = 0x01;
 
-/// TCP flags
-const TCP_FIN: u8 = 0x01;
-const TCP_SYN: u8 = 0x02;
-const TCP_RST: u8 = 0x04;
-const TCP_PSH: u8 = 0x08;
-const TCP_ACK: u8 = 0x10;
+#[cfg(not(feature = "smoltcp"))]
+mod minitcp_consts {
+    /// TCP flags
+    pub const TCP_FIN: u8 = 0x01;
+    pub const TCP_SYN: u8 = 0x02;
+    pub const TCP_RST: u8 = 0x04;
+    pub const TCP_PSH: u8 = 0x08;
+    pub const TCP_ACK: u8 = 0x10;
 
-/// ICMPv6
-const IPPROTO_ICMPV6: u8 = 58;
-const ICMPV6_ECHO_REQUEST: u8 = 128;
-const ICMPV6_ECHO_REPLY: u8 = 129;
+    /// ICMPv6
+    pub const IPPROTO_ICMPV6: u8 = 58;
+    pub const ICMPV6_ECHO_REQUEST: u8 = 128;
+    pub const ICMPV6_ECHO_REPLY: u8 = 129;
+}
+#[cfg(not(feature = "smoltcp"))]
+use minitcp_consts::*;
 
 // ============================================================================
 // Global State
@@ -478,9 +483,10 @@ impl rand_core::RngCore for EspRng {
 impl rand_core::CryptoRng for EspRng {}
 
 // ============================================================================
-// Minimal Userspace IPv6 + TCP Stack
+// Minimal Userspace IPv6 + TCP Stack (used when smoltcp feature is disabled)
 // ============================================================================
 
+#[cfg(not(feature = "smoltcp"))]
 #[allow(dead_code)]
 struct Ipv6Header {
     src: [u8; 16],
@@ -490,6 +496,7 @@ struct Ipv6Header {
     hop_limit: u8,
 }
 
+#[cfg(not(feature = "smoltcp"))]
 #[allow(dead_code)]
 struct TcpHeader {
     src_port: u16,
@@ -501,6 +508,7 @@ struct TcpHeader {
     window: u16,
 }
 
+#[cfg(not(feature = "smoltcp"))]
 fn parse_ipv6(data: &[u8]) -> Option<(Ipv6Header, &[u8])> {
     if data.len() < 40 {
         return None;
@@ -531,6 +539,7 @@ fn parse_ipv6(data: &[u8]) -> Option<(Ipv6Header, &[u8])> {
     ))
 }
 
+#[cfg(not(feature = "smoltcp"))]
 fn parse_tcp(data: &[u8]) -> Option<(TcpHeader, &[u8])> {
     if data.len() < 20 {
         return None;
@@ -560,6 +569,7 @@ fn parse_tcp(data: &[u8]) -> Option<(TcpHeader, &[u8])> {
     ))
 }
 
+#[cfg(not(feature = "smoltcp"))]
 fn tcp_checksum_ipv6(src: &[u8; 16], dst: &[u8; 16], tcp_segment: &[u8]) -> u16 {
     let mut sum: u32 = 0;
     for i in (0..16).step_by(2) {
@@ -590,6 +600,7 @@ fn tcp_checksum_ipv6(src: &[u8; 16], dst: &[u8; 16], tcp_segment: &[u8]) -> u16 
     !(sum as u16)
 }
 
+#[cfg(not(feature = "smoltcp"))]
 fn build_ipv6_tcp(
     src_addr: &[u8; 16],
     dst_addr: &[u8; 16],
@@ -638,9 +649,10 @@ fn build_ipv6_tcp(
 }
 
 // ============================================================================
-// ICMPv6 Echo Reply
+// ICMPv6 Echo Reply (used when smoltcp feature is disabled)
 // ============================================================================
 
+#[cfg(not(feature = "smoltcp"))]
 /// Compute ICMPv6 checksum with IPv6 pseudo-header.
 fn icmpv6_checksum(src: &[u8; 16], dst: &[u8; 16], icmp_data: &[u8]) -> u16 {
     let mut sum: u32 = 0;
@@ -677,6 +689,7 @@ fn icmpv6_checksum(src: &[u8; 16], dst: &[u8; 16], icmp_data: &[u8]) -> u16 {
     !(sum as u16)
 }
 
+#[cfg(not(feature = "smoltcp"))]
 /// Build an ICMPv6 Echo Reply for a received Echo Request.
 /// Returns the full IPv6 packet, or None if the input isn't a valid echo request.
 fn build_icmpv6_echo_reply(our_addr: &[u8; 16], ipv6_packet: &[u8]) -> Option<Vec<u8>> {
@@ -717,9 +730,10 @@ fn build_icmpv6_echo_reply(our_addr: &[u8; 16], ipv6_packet: &[u8]) -> Option<Ve
 }
 
 // ============================================================================
-// Mini TCP State Machine (UART bridge variant)
+// Mini TCP State Machine (UART bridge variant, used when smoltcp is disabled)
 // ============================================================================
 
+#[cfg(not(feature = "smoltcp"))]
 #[derive(Debug, Clone, Copy, PartialEq)]
 #[allow(dead_code)]
 enum TcpState {
@@ -731,6 +745,7 @@ enum TcpState {
     Closed,
 }
 
+#[cfg(not(feature = "smoltcp"))]
 struct MiniTcpUart {
     our_addr: [u8; 16],
     state: TcpState,
@@ -741,6 +756,7 @@ struct MiniTcpUart {
     their_seq: u32,
 }
 
+#[cfg(not(feature = "smoltcp"))]
 impl MiniTcpUart {
     fn new(our_addr: [u8; 16], listen_port: u16) -> Self {
         let mut isn = [0u8; 4];
@@ -960,6 +976,90 @@ impl MiniTcpUart {
 }
 
 // ============================================================================
+// smoltcp Device (used when smoltcp feature is enabled)
+// ============================================================================
+
+#[cfg(feature = "smoltcp")]
+mod ygg_device {
+    use alloc::collections::VecDeque;
+    use alloc::vec;
+    use alloc::vec::Vec;
+
+    use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
+    use smoltcp::time::Instant as SmolInstant;
+
+    pub struct YggDevice {
+        rx_queue: VecDeque<Vec<u8>>,
+        tx_queue: VecDeque<Vec<u8>>,
+    }
+
+    impl YggDevice {
+        pub fn new() -> Self {
+            Self {
+                rx_queue: VecDeque::new(),
+                tx_queue: VecDeque::new(),
+            }
+        }
+
+        /// Enqueue an inbound IPv6 packet (from Yggdrasil Deliver event).
+        pub fn push_rx(&mut self, pkt: Vec<u8>) {
+            self.rx_queue.push_back(pkt);
+        }
+
+        /// Drain all outbound packets (to send via Yggdrasil).
+        pub fn drain_tx(&mut self) -> impl Iterator<Item = Vec<u8>> + '_ {
+            self.tx_queue.drain(..)
+        }
+    }
+
+    pub struct YggRxToken(Vec<u8>);
+
+    impl RxToken for YggRxToken {
+        fn consume<R, F: FnOnce(&[u8]) -> R>(self, f: F) -> R {
+            f(&self.0)
+        }
+    }
+
+    pub struct YggTxToken<'a>(&'a mut VecDeque<Vec<u8>>);
+
+    impl<'a> TxToken for YggTxToken<'a> {
+        fn consume<R, F: FnOnce(&mut [u8]) -> R>(self, len: usize, f: F) -> R {
+            let mut buf = vec![0u8; len];
+            let r = f(&mut buf);
+            self.0.push_back(buf);
+            r
+        }
+    }
+
+    impl Device for YggDevice {
+        type RxToken<'a> = YggRxToken;
+        type TxToken<'a> = YggTxToken<'a>;
+
+        fn receive(
+            &mut self,
+            _timestamp: SmolInstant,
+        ) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
+            let data = self.rx_queue.pop_front()?;
+            Some((YggRxToken(data), YggTxToken(&mut self.tx_queue)))
+        }
+
+        fn transmit(&mut self, _timestamp: SmolInstant) -> Option<Self::TxToken<'_>> {
+            Some(YggTxToken(&mut self.tx_queue))
+        }
+
+        fn capabilities(&self) -> DeviceCapabilities {
+            let mut caps = DeviceCapabilities::default();
+            caps.max_transmission_unit = 65535;
+            caps.medium = Medium::Ip;
+            caps
+        }
+    }
+}
+
+#[cfg(feature = "smoltcp")]
+use ygg_device::YggDevice;
+
+// ============================================================================
 // IPv6 Address Helpers
 // ============================================================================
 
@@ -1035,7 +1135,7 @@ async fn main(spawner: Spawner) -> ! {
     let config = esp_hal::Config::default().with_cpu_clock(CpuClock::max());
     let peripherals = esp_hal::init(config);
 
-    esp_alloc::heap_allocator!(size: 72 * 1024);
+    esp_alloc::heap_allocator!(size: 96 * 1024);
 
     // ── Load/generate Yggdrasil key ────────────────────────────────────
     let mut flash = FlashStorage::new(peripherals.FLASH);
@@ -1387,9 +1487,6 @@ async fn yggdrasil_task(
     }
     log::info!("STA link up, starting Yggdrasil connections");
 
-    // Set up userspace TCP stack for UART bridge
-    let mut mini_tcp = MiniTcpUart::new(our_addr, listen_port);
-
     // IPv6 → PublicKey routing table (small fixed-size array for no_std)
     let mut addr_to_key: Vec<(core::net::Ipv6Addr, PublicKey)> = Vec::new();
 
@@ -1434,11 +1531,11 @@ async fn yggdrasil_task(
             &mut node,
             &signing_key,
             &public_key,
-            &mut mini_tcp,
             &mut addr_to_key,
             peer_ip,
             peer_port,
             &our_addr,
+            listen_port,
         )
         .await
         {
@@ -1469,11 +1566,11 @@ async fn connect_and_run_peer(
     node: &mut YggdrasilLite,
     signing_key: &SigningKey,
     public_key: &PublicKey,
-    mini_tcp: &mut MiniTcpUart,
     addr_to_key: &mut Vec<(core::net::Ipv6Addr, PublicKey)>,
     peer_ip: core::net::IpAddr,
     peer_port: u16,
     our_addr: &[u8; 16],
+    listen_port: u16,
 ) -> Result<(), &'static str> {
     use embedded_tls::{Aes256GcmSha384, TlsConfig, TlsConnection, TlsContext, UnsecureProvider};
 
@@ -1590,103 +1687,326 @@ async fn connect_and_run_peer(
     log::info!(
         "Yggdrasil online! Listening on [{}]:{}",
         format_ipv6(our_addr),
-        mini_tcp.local_port
+        listen_port
     );
 
     // ── Event loop ─────────────────────────────────────────────────────
-    let mut last_poll_ms: u64 = 0;
-    let mut last_status_ms: u64 = 0;
-    let start = embassy_time::Instant::now();
-    let mut tls_buf = [0u8; 4096];
-    let mut uart_buf = [0u8; 256];
 
-    loop {
-        let now_ms = start.elapsed().as_millis() as u64;
+    #[cfg(not(feature = "smoltcp"))]
+    {
+        let mut mini_tcp = MiniTcpUart::new(*our_addr, listen_port);
+        let mut last_poll_ms: u64 = 0;
+        let mut last_status_ms: u64 = 0;
+        let start = embassy_time::Instant::now();
+        let mut tls_buf = [0u8; 4096];
+        let mut uart_buf = [0u8; 256];
 
-        // ── 1. Read from TLS (with timeout so we don't block forever) ──
-        let tls_read = tls.read(&mut tls_buf);
-        let timeout = Timer::after(Duration::from_millis(50));
+        loop {
+            let now_ms = start.elapsed().as_millis() as u64;
 
-        match select(tls_read, timeout).await {
-            Either::First(Ok(0)) => {
-                log::info!("Peer disconnected (EOF)");
-                return Ok(());
+            // ── 1. Read from TLS (with timeout so we don't block forever)
+            let tls_read = tls.read(&mut tls_buf);
+            let timeout = Timer::after(Duration::from_millis(50));
+
+            match select(tls_read, timeout).await {
+                Either::First(Ok(0)) => {
+                    log::info!("Peer disconnected (EOF)");
+                    return Ok(());
+                }
+                Either::First(Ok(n)) => {
+                    let events = node.handle_peer_data(peer_id, &tls_buf[..n], now_ms, &mut EspRng);
+                    process_ygg_events(
+                        &events, &mut tls, &mut mini_tcp, addr_to_key, node, our_addr, now_ms,
+                    )
+                    .await;
+                }
+                Either::First(Err(_e)) => {
+                    log::error!("TLS read error");
+                    return Err("TLS read error");
+                }
+                Either::Second(_) => {
+                    // Timeout — proceed to other work
+                }
             }
-            Either::First(Ok(n)) => {
-                let events = node.handle_peer_data(peer_id, &tls_buf[..n], now_ms, &mut EspRng);
-                process_ygg_events(
-                    &events, &mut tls, mini_tcp, addr_to_key, node, our_addr, now_ms,
-                )
-                .await;
+
+            // ── 2. Send UART data over TCP overlay
+            if mini_tcp.is_connected() {
+                let uart_read = UART_TO_TCP.read(&mut uart_buf);
+                let timeout = Timer::after(Duration::from_millis(1));
+
+                match select(uart_read, timeout).await {
+                    Either::First(n) if n > 0 => {
+                        if let Some(pkt) = mini_tcp.send_data(&uart_buf[..n]) {
+                            if let Some(dest_key) = get_dest_key_from_ipv6(&pkt, addr_to_key) {
+                                let mut payload = Vec::with_capacity(1 + pkt.len());
+                                payload.push(TYPE_SESSION_TRAFFIC);
+                                payload.extend_from_slice(&pkt);
+
+                                let send_events = node.send(&dest_key, &payload, now_ms, &mut EspRng);
+                                for sev in &send_events {
+                                    if let NodeEvent::SendToPeer { data, .. } = sev {
+                                        let _ = tls.write_all(data).await;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
             }
-            Either::First(Err(_e)) => {
-                log::error!("TLS read error");
-                return Err("TLS read error");
+
+            // ── 3. Periodic node poll
+            let now_ms = start.elapsed().as_millis() as u64;
+            if now_ms.saturating_sub(last_poll_ms) >= 100 {
+                last_poll_ms = now_ms;
+                let events = node.poll(now_ms, &mut EspRng);
+                if !events.is_empty() {
+                    for ev in &events {
+                        if let NodeEvent::SendToPeer { data, .. } = ev {
+                            let _ = tls.write_all(data).await;
+                        }
+                    }
+                }
             }
-            Either::Second(_) => {
-                // Timeout — proceed to other work
+
+            // ── 4. Flush TLS
+            let _ = tls.flush().await;
+
+            // ── 5. Status output
+            if now_ms.saturating_sub(last_status_ms) >= 30_000 {
+                last_status_ms = now_ms;
+                log::info!(
+                    "uptime={}s peers={} sessions={} paths={} uart={}",
+                    now_ms / 1000,
+                    node.peer_count(),
+                    node.session_count(),
+                    node.path_count(),
+                    if UART_CONNECTED.load(Ordering::Relaxed) { "connected" } else { "idle" },
+                );
             }
         }
+    }
 
-        // ── 2. Send UART data over TCP overlay ─────────────────────────
-        if mini_tcp.is_connected() {
-            // Try reading from UART pipe (non-blocking)
-            let uart_read = UART_TO_TCP.read(&mut uart_buf);
-            let timeout = Timer::after(Duration::from_millis(1));
+    #[cfg(feature = "smoltcp")]
+    {
+        use smoltcp::iface::{Config as IfaceConfig, Interface, SocketSet, SocketStorage};
+        use smoltcp::socket::tcp;
+        use smoltcp::time::Instant as SmolInstant;
+        use smoltcp::wire::{HardwareAddress, IpCidr, Ipv6Address};
 
-            match select(uart_read, timeout).await {
-                Either::First(n) if n > 0 => {
-                    if let Some(pkt) = mini_tcp.send_data(&uart_buf[..n]) {
-                        if let Some(dest_key) = get_dest_key_from_ipv6(&pkt, addr_to_key) {
-                            let mut payload = Vec::with_capacity(1 + pkt.len());
-                            payload.push(TYPE_SESSION_TRAFFIC);
-                            payload.extend_from_slice(&pkt);
+        let mut device = YggDevice::new();
 
-                            let send_events = node.send(&dest_key, &payload, now_ms, &mut EspRng);
-                            for sev in &send_events {
-                                if let NodeEvent::SendToPeer { data, .. } = sev {
-                                    let _ = tls.write_all(data).await;
+        // Configure smoltcp interface
+        let mut config = IfaceConfig::new(HardwareAddress::Ip);
+        config.random_seed = {
+            let mut rng = EspRng;
+            (rng.next_u32() as u64) << 32 | rng.next_u32() as u64
+        };
+
+        let mut iface = Interface::new(config, &mut device, SmolInstant::from_millis(0));
+
+        // Set our Yggdrasil IPv6 address with /7 prefix
+        let local_ip = Ipv6Address::from(*our_addr);
+        iface.update_ip_addrs(|addrs| {
+            addrs.push(IpCidr::new(local_ip.into(), 7)).unwrap();
+        });
+
+        // Create TCP socket with 1KB buffers (UART is only 115200 baud ≈ 11KB/s)
+        let tcp_rx_buf = tcp::SocketBuffer::new(alloc::vec![0u8; 1024]);
+        let tcp_tx_buf = tcp::SocketBuffer::new(alloc::vec![0u8; 1024]);
+        let tcp_socket = tcp::Socket::new(tcp_rx_buf, tcp_tx_buf);
+
+        let mut socket_storage = [SocketStorage::EMPTY];
+        let mut sockets = SocketSet::new(&mut socket_storage[..]);
+        let tcp_handle = sockets.add(tcp_socket);
+
+        // Start listening
+        sockets
+            .get_mut::<tcp::Socket>(tcp_handle)
+            .listen(listen_port)
+            .unwrap();
+        log::info!("smoltcp: TCP listening on port {}", listen_port);
+
+        let mut last_poll_ms: u64 = 0;
+        let mut last_status_ms: u64 = 0;
+        let start = embassy_time::Instant::now();
+        let mut tls_buf = [0u8; 4096];
+        let mut uart_buf = [0u8; 256];
+
+        loop {
+            let now_ms = start.elapsed().as_millis() as u64;
+            let smol_now = SmolInstant::from_millis(now_ms as i64);
+
+            // ── 1. Read from TLS ───────────────────────────────────────
+            let tls_read = tls.read(&mut tls_buf);
+            let timeout = Timer::after(Duration::from_millis(50));
+
+            match select(tls_read, timeout).await {
+                Either::First(Ok(0)) => {
+                    log::info!("Peer disconnected (EOF)");
+                    return Ok(());
+                }
+                Either::First(Ok(n)) => {
+                    let events = node.handle_peer_data(peer_id, &tls_buf[..n], now_ms, &mut EspRng);
+                    for event in &events {
+                        match event {
+                            NodeEvent::SendToPeer { data, .. } => {
+                                let _ = tls.write_all(data).await;
+                            }
+                            NodeEvent::Deliver { source, data } => {
+                                if data.len() > 1 && data[0] == TYPE_SESSION_TRAFFIC {
+                                    let ipv6_packet = &data[1..];
+
+                                    // Record source key → IPv6 mapping
+                                    let source_addr = addr_for_key(source);
+                                    let source_ipv6 = core::net::Ipv6Addr::from(source_addr.0);
+                                    let mut found = false;
+                                    for (a, k) in addr_to_key.iter_mut() {
+                                        if *a == source_ipv6 {
+                                            *k = *source;
+                                            found = true;
+                                            break;
+                                        }
+                                    }
+                                    if !found && addr_to_key.len() < 32 {
+                                        addr_to_key.push((source_ipv6, *source));
+                                    }
+
+                                    log::debug!("RECV {} bytes from {}", ipv6_packet.len(), source_ipv6);
+
+                                    // Feed to smoltcp — ICMPv6 is handled automatically
+                                    device.push_rx(ipv6_packet.to_vec());
                                 }
                             }
                         }
                     }
                 }
-                _ => {}
+                Either::First(Err(_e)) => {
+                    log::error!("TLS read error");
+                    return Err("TLS read error");
+                }
+                Either::Second(_) => {}
             }
-        }
 
-        // ── 3. Periodic node poll ──────────────────────────────────────
-        let now_ms = start.elapsed().as_millis() as u64;
-        if now_ms.saturating_sub(last_poll_ms) >= 100 {
-            last_poll_ms = now_ms;
-            let events = node.poll(now_ms, &mut EspRng);
-            if !events.is_empty() {
-                for ev in &events {
-                    if let NodeEvent::SendToPeer { data, .. } = ev {
-                        let _ = tls.write_all(data).await;
+            // ── 2. smoltcp poll (processes rx, generates tx) ───────────
+            iface.poll(smol_now, &mut device, &mut sockets);
+
+            // ── 3. Drain outbound packets → send via Yggdrasil ─────────
+            for pkt in device.drain_tx() {
+                if let Some(dest_key) = get_dest_key_from_ipv6(&pkt, addr_to_key) {
+                    let mut payload = Vec::with_capacity(1 + pkt.len());
+                    payload.push(TYPE_SESSION_TRAFFIC);
+                    payload.extend_from_slice(&pkt);
+
+                    let send_events = node.send(&dest_key, &payload, now_ms, &mut EspRng);
+                    for sev in &send_events {
+                        if let NodeEvent::SendToPeer { data, .. } = sev {
+                            let _ = tls.write_all(data).await;
+                        }
                     }
                 }
             }
-        }
 
-        // ── 4. Flush TLS ───────────────────────────────────────────────
-        let _ = tls.flush().await;
+            // ── 4. TCP socket ↔ UART bridging ──────────────────────────
+            {
+                let socket = sockets.get_mut::<tcp::Socket>(tcp_handle);
 
-        // ── 5. Status output ───────────────────────────────────────────
-        if now_ms.saturating_sub(last_status_ms) >= 30_000 {
-            last_status_ms = now_ms;
-            log::info!(
-                "uptime={}s peers={} sessions={} paths={} uart={}",
-                now_ms / 1000,
-                node.peer_count(),
-                node.session_count(),
-                node.path_count(),
-                if UART_CONNECTED.load(Ordering::Relaxed) { "connected" } else { "idle" },
-            );
+                // TCP → UART: read from socket, write to UART pipe
+                if socket.can_recv() {
+                    let mut tmp = [0u8; 256];
+                    if let Ok(n) = socket.recv_slice(&mut tmp) {
+                        if n > 0 {
+                            // Non-blocking write to UART pipe
+                            let written = TCP_TO_UART.try_write(&tmp[..n]).unwrap_or(0);
+                            if written < n {
+                                log::warn!("UART pipe full, dropped {} bytes", n - written);
+                            }
+                        }
+                    }
+                }
+
+                // UART → TCP: read from UART pipe, write to socket
+                if socket.can_send() {
+                    let uart_read = UART_TO_TCP.read(&mut uart_buf);
+                    let timeout = Timer::after(Duration::from_millis(1));
+
+                    match select(uart_read, timeout).await {
+                        Either::First(n) if n > 0 => {
+                            if let Err(e) = socket.send_slice(&uart_buf[..n]) {
+                                log::warn!("TCP send error: {:?}", e);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+
+                // Track connection state
+                let is_active = socket.is_active();
+                UART_CONNECTED.store(is_active, Ordering::Relaxed);
+
+                // Re-listen if socket closed
+                if !is_active && !socket.is_listening() {
+                    log::info!("smoltcp: TCP socket closed, re-listening on port {}", listen_port);
+                    socket.abort();
+                    if let Err(e) = socket.listen(listen_port) {
+                        log::error!("smoltcp: re-listen failed: {:?}", e);
+                    }
+                }
+            }
+
+            // ── 5. Second smoltcp poll (flushes TCP responses) ─────────
+            iface.poll(smol_now, &mut device, &mut sockets);
+
+            // Drain tx again after second poll
+            for pkt in device.drain_tx() {
+                if let Some(dest_key) = get_dest_key_from_ipv6(&pkt, addr_to_key) {
+                    let mut payload = Vec::with_capacity(1 + pkt.len());
+                    payload.push(TYPE_SESSION_TRAFFIC);
+                    payload.extend_from_slice(&pkt);
+
+                    let send_events = node.send(&dest_key, &payload, now_ms, &mut EspRng);
+                    for sev in &send_events {
+                        if let NodeEvent::SendToPeer { data, .. } = sev {
+                            let _ = tls.write_all(data).await;
+                        }
+                    }
+                }
+            }
+
+            // ── 6. Periodic node poll ──────────────────────────────────
+            let now_ms = start.elapsed().as_millis() as u64;
+            if now_ms.saturating_sub(last_poll_ms) >= 100 {
+                last_poll_ms = now_ms;
+                let events = node.poll(now_ms, &mut EspRng);
+                if !events.is_empty() {
+                    for ev in &events {
+                        if let NodeEvent::SendToPeer { data, .. } = ev {
+                            let _ = tls.write_all(data).await;
+                        }
+                    }
+                }
+            }
+
+            // ── 7. Flush TLS ───────────────────────────────────────────
+            let _ = tls.flush().await;
+
+            // ── 8. Status output ───────────────────────────────────────
+            if now_ms.saturating_sub(last_status_ms) >= 30_000 {
+                last_status_ms = now_ms;
+                log::info!(
+                    "uptime={}s peers={} sessions={} paths={} uart={}",
+                    now_ms / 1000,
+                    node.peer_count(),
+                    node.session_count(),
+                    node.path_count(),
+                    if UART_CONNECTED.load(Ordering::Relaxed) { "connected" } else { "idle" },
+                );
+            }
         }
     }
 }
 
+#[cfg(not(feature = "smoltcp"))]
 async fn process_ygg_events<'a>(
     events: &[NodeEvent],
     tls: &mut embedded_tls::TlsConnection<'a, TcpSocket<'a>, embedded_tls::Aes256GcmSha384>,
