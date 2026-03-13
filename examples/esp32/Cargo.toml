@@ -62,6 +62,7 @@ esp-hal-dhcp-server = "0.2"
 [features]
 default = ["esp32c6"]
 smoltcp = ["dep:smoltcp"]
+proxy = ["smoltcp"]
 esp32c6 = [
     "esp-backtrace/esp32c6",
     "esp-bootloader-esp-idf/esp32c6",
@@ -69,6 +70,14 @@ esp32c6 = [
     "esp-rtos/esp32c6",
     "esp-radio/esp32c6",
     "esp-storage/esp32c6",
+]
+esp32 = [
+    "esp-backtrace/esp32",
+    "esp-bootloader-esp-idf/esp32",
+    "esp-hal/esp32",
+    "esp-rtos/esp32",
+    "esp-radio/esp32",
+    "esp-storage/esp32",
 ]
 
 [profile.dev]

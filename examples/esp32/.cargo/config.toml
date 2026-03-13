@@ -5,8 +5,12 @@ rustflags = [
   "-C", "force-frame-pointers",
 ]
 
-[build]
-target = "riscv32imac-unknown-none-elf"
+[target.'cfg(target_arch = "xtensa")']
+runner    = "espflash flash --monitor"
+rustflags = [
+  "-C", "link-arg=-Tlinkall.x",
+  "-C", "force-frame-pointers",
+]
 
 [env]
 ESP_LOG = "info"

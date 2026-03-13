@@ -1,4 +1,6 @@
-//! ESP32-C6 Yggdrasil TCP-UART Bridge
+//! ESP32 Yggdrasil TCP-UART Bridge
+//!
+//! Supports ESP32-C6 (RISC-V) and ESP32 (Xtensa) via Cargo features.
 //!
 //! Boots → connects to WiFi → establishes TLS connections to up to 3 Yggdrasil
 //! peers → listens for TCP on the Yggdrasil overlay → bridges TCP↔UART.
@@ -31,6 +33,7 @@ use esp_bootloader_esp_idf::partitions;
 use esp_hal::{
     clock::CpuClock,
     interrupt::software::SoftwareInterruptControl,
+    ram,
     rng::Rng,
     timer::timg::TimerGroup,
     uart::{self, Uart},
@@ -1135,7 +1138,13 @@ async fn main(spawner: Spawner) -> ! {
     let config = esp_hal::Config::default().with_cpu_clock(CpuClock::max());
     let peripherals = esp_hal::init(config);
 
+    #[cfg(feature = "esp32c6")]
     esp_alloc::heap_allocator!(size: 96 * 1024);
+    // ESP32: place heap in bootloader-reclaimed dram2_seg (~98KB),
+    // separate from the stack in dram_seg (192KB), avoiding both
+    // stack overflow (heap too large) and OOM (heap too small).
+    #[cfg(feature = "esp32")]
+    esp_alloc::heap_allocator!(#[ram(reclaimed)] size: 96 * 1024);
 
     // ── Load/generate Yggdrasil key ────────────────────────────────────
     let mut flash = FlashStorage::new(peripherals.FLASH);
@@ -1236,10 +1245,15 @@ async fn main(spawner: Spawner) -> ! {
 
     // Initialize UART
     let uart_config = uart::Config::default().with_baudrate(UART_BAUD_RATE);
+    #[cfg(feature = "esp32c6")]
+    let (uart_rx_pin, uart_tx_pin) = (peripherals.GPIO20, peripherals.GPIO19);
+    #[cfg(feature = "esp32")]
+    let (uart_rx_pin, uart_tx_pin) = (peripherals.GPIO16, peripherals.GPIO17);
+
     let uart = Uart::new(peripherals.UART1, uart_config)
         .unwrap()
-        .with_rx(peripherals.GPIO20)
-        .with_tx(peripherals.GPIO19)
+        .with_rx(uart_rx_pin)
+        .with_tx(uart_tx_pin)
         .into_async();
     let (uart_rx, uart_tx) = uart.split();
     UART_CONNECTED.store(false, Ordering::Relaxed);

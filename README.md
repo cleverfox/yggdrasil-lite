@@ -4,7 +4,7 @@ Minimal leaf-only [Yggdrasil](https://yggdrasil-network.github.io/) client for e
 
 Implements the Yggdrasil/Ironwood protocol subset needed to operate as a **leaf node**: connect to peers, join the spanning tree, discover paths via bloom filters, and exchange end-to-end encrypted packets with any node in the network. No transit routing, no TUN interface, no admin API.
 
-Designed for `no_std` + `alloc` environments (ESP32-C6 with Embassy), but also builds with `std` for desktop testing.
+Designed for `no_std` + `alloc` environments (ESP32 with Embassy), but also builds with `std` for desktop testing.
 
 ## Features
 
@@ -155,18 +155,23 @@ cargo run --example lite_node -p yggdrasil-lite -- 127.0.0.1:2020
 curl -6 --max-time 30 "http://[<lite_ipv6>]:80/hello"
 ```
 
-### ESP32-C6: Yggdrasil TCP-UART Bridge
+### ESP32: Yggdrasil TCP-UART Bridge
 
-A firmware for ESP32-C6 (tested on **ESP32-C6-WROOM-1**) that bridges TCP connections over the Yggdrasil mesh to a hardware UART. The device connects to WiFi, establishes a TLS connection to Yggdrasil peers, and listens for TCP and ICMPv6 on its overlay IPv6 address.
+A firmware for ESP32 (C6 and and 32D) that bridges TCP connections over the Yggdrasil mesh to a hardware UART. The device connects to WiFi, establishes a TLS connection to Yggdrasil peers, and listens for TCP and ICMPv6 on its overlay IPv6 address. Target chip is selected via Cargo features.
 
-See [`examples/esp32c6/`](examples/esp32c6/) for the full project. Quick start:
+See [`examples/esp32/`](examples/esp32/) for the full project. Quick start:
 
 ```sh
-cd examples/esp32c6
+cd examples/esp32
 
 # Edit .cargo/config.toml with your WiFi and peer settings
 # Then build and flash:
-cargo run --release
+
+# ESP32-C6 (RISC-V)
+cargo run --release --target riscv32imac-unknown-none-elf --features esp32c6
+
+# ESP32 (Xtensa) — requires esp toolchain
+cargo +esp run --release --target xtensa-esp32-none-elf --features esp32 --no-default-features
 ```
 
 On boot the device prints its Yggdrasil IPv6 address. You can then connect to it from anywhere on the mesh:
@@ -199,8 +204,11 @@ cargo test
 cargo run --example lite_node -- 127.0.0.1:12345
 
 # ESP32-C6 (no_std) — requires nightly toolchain
-cd examples/esp32c6
-cargo build --release
+cd examples/esp32
+cargo build --release --target riscv32imac-unknown-none-elf --features esp32c6
+
+# ESP32 (no_std) — requires esp toolchain
+cargo +esp build --release --target xtensa-esp32-none-elf --features esp32 --no-default-features
 ```
 
 ## License

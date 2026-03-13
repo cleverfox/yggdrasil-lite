@@ -1,6 +1,8 @@
-# ESP32-C6 Yggdrasil TCP-UART Bridge
+# ESP32 Yggdrasil TCP-UART Bridge
 
-Firmware for ESP32-C6 that bridges TCP connections over the Yggdrasil mesh network to a hardware UART. The device connects to WiFi, establishes a TLS connection to a Yggdrasil peer, and listens for incoming TCP on its Yggdrasil IPv6 address. Any data received over TCP is forwarded to UART TX, and UART RX data is sent back over TCP.
+Firmware for ESP32 family that bridges TCP connections over the Yggdrasil mesh network to a hardware UART. The device connects to WiFi, establishes a TLS connection to a Yggdrasil peer, and listens for incoming TCP on its Yggdrasil IPv6 address. Any data received over TCP is forwarded to UART TX, and UART RX data is sent back over TCP.
+
+Supports **ESP32-C6** (RISC-V) and **ESP32** (Xtensa) via Cargo features.
 
 ## Features
 
@@ -11,10 +13,14 @@ Firmware for ESP32-C6 that bridges TCP connections over the Yggdrasil mesh netwo
 - Web UI for Yggdrasil peer and WiFi configuration
 - Console boot banner with IPv6 address and port
 
-## Hardware
+## Supported Hardware
 
-- **Board**: Any ESP32-C6 development board
-- **UART**: TX on GPIO19, RX on GPIO20 (115200 baud)
+| Chip | Architecture | UART Pins | Heap |
+|------|-------------|-----------|------|
+| ESP32-C6 | RISC-V | TX: GPIO19, RX: GPIO20 | 96 KB |
+| ESP32 | Xtensa | TX: GPIO17, RX: GPIO16 | 64 KB |
+
+UART baud rate: 115200
 
 ## Configuration
 
@@ -34,12 +40,23 @@ These defaults are used on first boot. After that, settings saved via the web UI
 
 ## Build & Flash
 
+### ESP32-C6 (RISC-V)
+
 ```sh
-cd examples/esp32c6
-cargo run --release
+cd examples/esp32
+cargo run --release --target riscv32imac-unknown-none-elf --features esp32c6
 ```
 
-This builds the firmware and flashes it via `espflash`. The serial monitor starts automatically after flashing.
+### ESP32 (Xtensa)
+
+Requires the [esp Rust toolchain](https://github.com/esp-rs/rust-build):
+
+```sh
+cd examples/esp32
+cargo +esp run --release --target xtensa-esp32-none-elf --features esp32 --no-default-features
+```
+
+Both commands build and flash via `espflash`. The serial monitor starts automatically after flashing.
 
 ## Quick Test
 
@@ -51,7 +68,7 @@ This builds the firmware and flashes it via `espflash`. The serial monitor start
 
    Note the TLS listen address from the logs (e.g. `tls://0.0.0.0:2020`).
 
-2. **Configure the ESP32-C6** with the peer address in `.cargo/config.toml`:
+2. **Configure the ESP32** with the peer address in `.cargo/config.toml`:
 
    ```toml
    YGG_PEER1 = "192.168.1.100:2020"
@@ -111,11 +128,17 @@ Settings are saved to flash. Reboot the device after changing configuration.
 By default the firmware uses `MiniTcpUart` — a minimal hand-rolled TCP state machine (~200 lines) with manual ICMPv6 echo reply handling. An optional `smoltcp` feature replaces it with the [smoltcp](https://github.com/smoltcp-rs/smoltcp) TCP/IP stack.
 
 ```sh
-# Default build (MiniTcpUart)
-cargo run --release
+# ESP32-C6: default build (MiniTcpUart)
+cargo run --release --target riscv32imac-unknown-none-elf --features esp32c6
 
-# Build with smoltcp
-cargo run --release --features smoltcp
+# ESP32-C6: build with smoltcp
+cargo run --release --target riscv32imac-unknown-none-elf --features esp32c6,smoltcp
+
+# ESP32: default build (MiniTcpUart)
+cargo +esp run --release --target xtensa-esp32-none-elf --features esp32 --no-default-features
+
+# ESP32: build with smoltcp
+cargo +esp run --release --target xtensa-esp32-none-elf --features esp32,smoltcp --no-default-features
 ```
 
 ### MiniTcpUart (default)
