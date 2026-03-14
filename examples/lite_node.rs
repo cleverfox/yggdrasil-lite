@@ -29,6 +29,8 @@ use std::net::{Ipv6Addr, TcpStream};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use yggdrasil_lite::peer::PeerId;
+
 use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
 use rand::RngCore;
@@ -66,6 +68,42 @@ use minitcp_consts::*;
 
 /// Our HTTP listen port.
 const HTTP_PORT: u16 = 80;
+
+// ============================================================================
+// Per-peer connection state
+// ============================================================================
+
+struct PeerConn {
+    addr: String,
+    tcp: TcpStream,
+    tls: ClientConnection,
+    #[allow(dead_code)]
+    peer_id: PeerId,
+    tls_read_buf: Vec<u8>,
+}
+
+/// Write data to a specific peer, looked up by peer_id.
+fn send_to_peer(peers: &mut HashMap<PeerId, PeerConn>, peer_id: PeerId, data: &[u8]) {
+    if let Some(pc) = peers.get_mut(&peer_id) {
+        let _ = pc.tls.writer().write_all(data);
+        while pc.tls.wants_write() {
+            match pc.tls.write_tls(&mut pc.tcp) {
+                Ok(_) => {}
+                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                Err(_) => break,
+            }
+        }
+    }
+}
+
+/// Dispatch node events to the correct peers.
+fn dispatch_events(events: &[NodeEvent], peers: &mut HashMap<PeerId, PeerConn>) {
+    for ev in events {
+        if let NodeEvent::SendToPeer { peer_id, data } = ev {
+            send_to_peer(peers, *peer_id, data);
+        }
+    }
+}
 
 // ============================================================================
 // TLS support (accept all server certificates — auth is via Yggdrasil metadata)
@@ -722,24 +760,36 @@ use ygg_device::YggDevice;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
-    if args.len() < 2 {
-        eprintln!("Usage: {} <peer_addr:port> [--seed <hex_seed>]", args[0]);
+
+    // ── Parse CLI: <peer1:port> [<peer2:port> ...] [--seed <hex>] ────────
+    let seed_pos = args.iter().position(|a| a == "--seed");
+    let peer_addrs: Vec<&str> = args[1..]
+        .iter()
+        .enumerate()
+        .filter(|(i, a)| {
+            let abs_i = i + 1;
+            !a.starts_with("--") && seed_pos.map_or(true, |sp| abs_i != sp + 1)
+        })
+        .map(|(_, a)| a.as_str())
+        .collect();
+
+    if peer_addrs.is_empty() {
+        eprintln!("Usage: {} <peer1:port> [<peer2:port> ...] [--seed <hex_seed>]", args[0]);
         eprintln!();
-        eprintln!("Connects to a yggdrasil-ng node and serves HTTP on the overlay.");
+        eprintln!("Connects to one or more yggdrasil-ng nodes and serves HTTP on the overlay.");
         eprintln!();
         eprintln!("Options:");
         eprintln!("  --seed <hex>  Use a specific 32-byte Ed25519 seed (64 hex chars)");
         eprintln!();
         eprintln!("Example:");
         eprintln!("  {} 127.0.0.1:12345", args[0]);
-        eprintln!("  {} 127.0.0.1:12345 --seed abcdef0123...", args[0]);
+        eprintln!("  {} 127.0.0.1:12345 10.0.0.1:2020 --seed abcdef0123...", args[0]);
         std::process::exit(1);
     }
-    let peer_addr = &args[1];
 
     // ── Generate or load Ed25519 keypair ─────────────────────────────────
     let mut seed = [0u8; 32];
-    if let Some(pos) = args.iter().position(|a| a == "--seed") {
+    if let Some(pos) = seed_pos {
         if let Some(hex_str) = args.get(pos + 1) {
             let bytes = hex::decode(hex_str).expect("invalid hex seed");
             assert_eq!(bytes.len(), 32, "seed must be 32 bytes (64 hex chars)");
@@ -766,148 +816,148 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("╠══════════════════════════════════════════════════════════════╣");
     eprintln!("║  Public key: {}…", &hex::encode(&public_key)[..16]);
     eprintln!("║  IPv6:       {}", format_ipv6(&our_addr.0));
-    eprintln!("║  Peer:       {}", peer_addr);
+    for (i, addr) in peer_addrs.iter().enumerate() {
+        eprintln!("║  Peer {}:     {}", i, addr);
+    }
     eprintln!("╚══════════════════════════════════════════════════════════════╝");
 
-    // ── TCP connect ──────────────────────────────────────────────────────
-    let mut tcp = TcpStream::connect(peer_addr)?;
-    tcp.set_nodelay(true)?;
-    eprintln!("[CONN] TCP connected to {}", peer_addr);
-
-    // ── TLS handshake ────────────────────────────────────────────────────
-    let tls_config = create_tls_client_config();
-    let server_name = ServerName::try_from("yggdrasil")
-        .map_err(|e| format!("invalid server name: {}", e))?;
-    let mut tls = ClientConnection::new(Arc::new(tls_config), server_name)?;
-    complete_tls_handshake(&mut tls, &mut tcp)?;
-    eprintln!("[CONN] TLS handshake complete");
-
-    // ── Metadata handshake ───────────────────────────────────────────────
+    // ── Connect to all peers (sequentially, blocking) ────────────────────
+    let tls_config = Arc::new(create_tls_client_config());
     let password: &[u8] = b"";
     let our_meta = Metadata::new(public_key, 0);
     let meta_bytes = our_meta.encode(&signing_key, password);
 
-    // Send our metadata
-    tls.writer().write_all(&meta_bytes)?;
-    while tls.wants_write() {
-        tls.write_tls(&mut tcp)?;
-    }
-    eprintln!("[META] Sent metadata ({} bytes)", meta_bytes.len());
+    let mut peers: HashMap<PeerId, PeerConn> = HashMap::new();
 
-    // Read peer metadata
-    let peer_id;
-    let mut meta_accum = Vec::new();
-    loop {
-        if tls.wants_read() {
-            tls.read_tls(&mut tcp)?;
-            tls.process_new_packets()
-                .map_err(|e| format!("TLS error: {}", e))?;
+    for peer_addr in &peer_addrs {
+        eprintln!("[CONN] Connecting to {}...", peer_addr);
+        let mut tcp = TcpStream::connect(peer_addr)?;
+        tcp.set_nodelay(true)?;
+        eprintln!("[CONN] TCP connected to {}", peer_addr);
+
+        // TLS handshake
+        let server_name = ServerName::try_from("yggdrasil")
+            .map_err(|e| format!("invalid server name: {}", e))?;
+        let mut tls = ClientConnection::new(tls_config.clone(), server_name)?;
+        complete_tls_handshake(&mut tls, &mut tcp)?;
+        eprintln!("[CONN] TLS handshake complete");
+
+        // Send our metadata
+        tls.writer().write_all(&meta_bytes)?;
+        while tls.wants_write() {
+            tls.write_tls(&mut tcp)?;
         }
-        let mut tmp = vec![0u8; 512];
-        match tls.reader().read(&mut tmp) {
-            Ok(0) => continue,
-            Ok(n) => {
-                meta_accum.extend_from_slice(&tmp[..n]);
-                // Try to decode
-                match Metadata::decode(&meta_accum, password) {
-                    Ok((peer_meta, consumed)) => {
-                        if !peer_meta.check() {
-                            return Err("Incompatible protocol version".into());
-                        }
-                        eprintln!(
-                            "[META] Peer key: {}…",
-                            &hex::encode(&peer_meta.public_key)[..16]
-                        );
+        eprintln!("[META] Sent metadata ({} bytes)", meta_bytes.len());
 
-                        // Register peer with yggdrasil-lite
-                        let pid = node.add_peer(peer_meta.public_key, 0);
-                        node.mark_handshake_done(pid);
-                        peer_id = pid;
-                        eprintln!("[META] Peer registered (id={})", pid);
-
-                        // Any leftover bytes after metadata go into the frame buffer
-                        if meta_accum.len() > consumed {
-                            let leftover = meta_accum[consumed..].to_vec();
-                            let events = node.handle_peer_data(
-                                pid,
-                                &leftover,
-                                0,
-                                &mut OsRng,
+        // Read peer metadata
+        let mut meta_accum = Vec::new();
+        let peer_id = loop {
+            if tls.wants_read() {
+                tls.read_tls(&mut tcp)?;
+                tls.process_new_packets()
+                    .map_err(|e| format!("TLS error: {}", e))?;
+            }
+            let mut tmp = vec![0u8; 512];
+            match tls.reader().read(&mut tmp) {
+                Ok(0) => continue,
+                Ok(n) => {
+                    meta_accum.extend_from_slice(&tmp[..n]);
+                    match Metadata::decode(&meta_accum, password) {
+                        Ok((peer_meta, consumed)) => {
+                            if !peer_meta.check() {
+                                return Err("Incompatible protocol version".into());
+                            }
+                            eprintln!(
+                                "[META] Peer key: {}…",
+                                &hex::encode(&peer_meta.public_key)[..16]
                             );
-                            // Process events (just writes for now)
-                            for ev in &events {
-                                if let NodeEvent::SendToPeer { data, .. } = ev {
-                                    let _ = tls.writer().write_all(data);
+
+                            let pid = node.add_peer(peer_meta.public_key, 0);
+                            node.mark_handshake_done(pid);
+                            eprintln!("[META] Peer {} registered (id={})", peer_addr, pid);
+
+                            // Handle leftover bytes after metadata
+                            if meta_accum.len() > consumed {
+                                let leftover = meta_accum[consumed..].to_vec();
+                                let events = node.handle_peer_data(
+                                    pid, &leftover, 0, &mut OsRng,
+                                );
+                                for ev in &events {
+                                    if let NodeEvent::SendToPeer { data, .. } = ev {
+                                        let _ = tls.writer().write_all(data);
+                                    }
+                                }
+                                while tls.wants_write() {
+                                    let _ = tls.write_tls(&mut tcp);
                                 }
                             }
-                            while tls.wants_write() {
-                                let _ = tls.write_tls(&mut tcp);
+                            break pid;
+                        }
+                        Err(yggdrasil_lite::meta::MetaError::TooShort)
+                        | Err(yggdrasil_lite::meta::MetaError::BufferTooSmall) => continue,
+                        Err(e) => {
+                            return Err(format!("Metadata decode error: {:?}", e).into())
+                        }
+                    }
+                }
+                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    if tls.wants_read() {
+                        tls.read_tls(&mut tcp)?;
+                        tls.process_new_packets()
+                            .map_err(|e| format!("TLS error: {}", e))?;
+                    }
+                }
+                Err(e) => return Err(e.into()),
+            }
+        };
+
+        // Drain any TLS-buffered data from the metadata handshake
+        {
+            let mut drain_buf = vec![0u8; 65536];
+            loop {
+                match tls.reader().read(&mut drain_buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        let events =
+                            node.handle_peer_data(peer_id, &drain_buf[..n], 0, &mut OsRng);
+                        for ev in &events {
+                            if let NodeEvent::SendToPeer { data, .. } = ev {
+                                let _ = tls.writer().write_all(data);
                             }
                         }
-                        break;
                     }
-                    Err(yggdrasil_lite::meta::MetaError::TooShort)
-                    | Err(yggdrasil_lite::meta::MetaError::BufferTooSmall) => {
-                        // Need more data
-                        continue;
-                    }
-                    Err(e) => return Err(format!("Metadata decode error: {:?}", e).into()),
                 }
             }
-            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                // Read more TLS data
-                if tls.wants_read() {
-                    tls.read_tls(&mut tcp)?;
-                    tls.process_new_packets()
-                        .map_err(|e| format!("TLS error: {}", e))?;
-                }
-            }
-            Err(e) => return Err(e.into()),
         }
-    }
 
-    // ── Switch to non-blocking for the event loop ────────────────────────
-    tcp.set_nonblocking(true)?;
+        // Switch to non-blocking for the event loop
+        tcp.set_nonblocking(true)?;
+
+        peers.insert(peer_id, PeerConn {
+            addr: peer_addr.to_string(),
+            tcp,
+            tls,
+            peer_id,
+            tls_read_buf: vec![0u8; 65536],
+        });
+    }
 
     // IPv6 → PublicKey routing table (built from received packets)
     let mut addr_to_key: HashMap<Ipv6Addr, PublicKey> = HashMap::new();
 
-    // ── Drain any TLS-buffered data from the metadata handshake ──────────
-    // The TLS reader may have decrypted ironwood frames that arrived alongside
-    // the metadata.  Process them now so we reply promptly.
-    {
-        let mut drain_buf = vec![0u8; 65536];
-        loop {
-            match tls.reader().read(&mut drain_buf) {
-                Ok(0) | Err(_) => break,
-                Ok(n) => {
-                    let events =
-                        node.handle_peer_data(peer_id, &drain_buf[..n], 0, &mut OsRng);
-                    for ev in &events {
-                        if let NodeEvent::SendToPeer { data, .. } = ev {
-                            let _ = tls.writer().write_all(data);
-                        }
-                    }
-                }
-            }
-        }
-    }
-
     // ── Run initial poll immediately so we send SigReq + Bloom + KeepAlive
     {
         let events = node.poll(0, &mut OsRng);
-        for ev in &events {
-            if let NodeEvent::SendToPeer { data, .. } = ev {
-                let _ = tls.writer().write_all(data);
-            }
-        }
+        dispatch_events(&events, &mut peers);
     }
 
     // ── Flush everything written so far ──────────────────────────────────
-    while tls.wants_write() {
-        match tls.write_tls(&mut tcp) {
-            Ok(_) => {}
-            Err(_) => break,
+    for pc in peers.values_mut() {
+        while pc.tls.wants_write() {
+            match pc.tls.write_tls(&mut pc.tcp) {
+                Ok(_) => {}
+                Err(_) => break,
+            }
         }
     }
 
@@ -925,88 +975,108 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let start = Instant::now();
         let mut last_poll: u64 = 0;
         let mut last_status: u64 = 0;
-        let mut tls_read_buf = vec![0u8; 65536];
+        let mut disconnected: Vec<PeerId> = Vec::new();
 
         loop {
             let now_ms = start.elapsed().as_millis() as u64;
             let mut did_work = false;
 
-            // ── 1. Read new TLS records from TCP
-            match tls.read_tls(&mut tcp) {
-                Ok(0) => {
-                    eprintln!("[CONN] Peer disconnected (EOF)");
-                    break;
-                }
-                Ok(_n) => {
-                    match tls.process_new_packets() {
-                        Ok(_) => {}
-                        Err(e) => {
-                            eprintln!("[TLS] Error: {}", e);
-                            break;
+            // ── 1. Read from all peers ───────────────────────────────
+            // Phase 1: TLS read + decrypt into per-peer accumulated data
+            disconnected.clear();
+            let peer_ids: Vec<PeerId> = peers.keys().copied().collect();
+            let mut peer_data: Vec<(PeerId, Vec<u8>)> = Vec::new();
+
+            for &pid in &peer_ids {
+                let pc = peers.get_mut(&pid).unwrap();
+
+                // Read new TLS records from TCP
+                match pc.tls.read_tls(&mut pc.tcp) {
+                    Ok(0) => {
+                        eprintln!("[CONN] Peer {} disconnected (EOF)", pc.addr);
+                        disconnected.push(pid);
+                        continue;
+                    }
+                    Ok(_) => {
+                        match pc.tls.process_new_packets() {
+                            Ok(_) => {}
+                            Err(e) => {
+                                eprintln!("[TLS] Peer {} error: {}", pc.addr, e);
+                                disconnected.push(pid);
+                                continue;
+                            }
                         }
                     }
-                }
-                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {}
-                Err(e) => {
-                    eprintln!("[CONN] Read error: {}", e);
-                    break;
-                }
-            }
-
-            // ── 2. Consume decrypted data from TLS reader
-            loop {
-                match tls.reader().read(&mut tls_read_buf) {
-                    Ok(0) => break,
-                    Ok(n) => {
-                        let events = node.handle_peer_data(
-                            peer_id,
-                            &tls_read_buf[..n],
-                            now_ms,
-                            &mut OsRng,
-                        );
-                        process_events(
-                            &events,
-                            &mut tls,
-                            &mut tcp,
-                            &mut mini_tcp,
-                            &mut addr_to_key,
-                            &mut node,
-                            now_ms,
-                        );
-                        did_work = true;
+                    Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {}
+                    Err(e) => {
+                        eprintln!("[CONN] Peer {} read error: {}", pc.addr, e);
+                        disconnected.push(pid);
+                        continue;
                     }
-                    Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => break,
-                    Err(_) => break,
+                }
+
+                // Consume decrypted data from TLS reader into a buffer
+                let mut accum = Vec::new();
+                loop {
+                    match pc.tls.reader().read(&mut pc.tls_read_buf) {
+                        Ok(0) => break,
+                        Ok(n) => accum.extend_from_slice(&pc.tls_read_buf[..n]),
+                        Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                        Err(_) => break,
+                    }
+                }
+                if !accum.is_empty() {
+                    peer_data.push((pid, accum));
                 }
             }
 
-            // ── 3. Periodic node poll
+            // Phase 2: Process accumulated data (no borrow on peers)
+            for (pid, data) in &peer_data {
+                let events = node.handle_peer_data(*pid, data, now_ms, &mut OsRng);
+                process_events(
+                    &events, &mut peers, &mut mini_tcp,
+                    &mut addr_to_key, &mut node, now_ms,
+                );
+                did_work = true;
+            }
+
+            // Remove disconnected peers
+            for pid in &disconnected {
+                node.remove_peer(*pid);
+                if let Some(pc) = peers.remove(pid) {
+                    eprintln!("[CONN] Removed peer {} (id={})", pc.addr, pid);
+                }
+            }
+            if peers.is_empty() {
+                eprintln!("[CONN] All peers disconnected, exiting");
+                break;
+            }
+
+            // ── 2. Periodic node poll ────────────────────────────────
             if now_ms.saturating_sub(last_poll) >= 100 {
                 last_poll = now_ms;
                 let events = node.poll(now_ms, &mut OsRng);
                 if !events.is_empty() {
-                    for ev in &events {
-                        if let NodeEvent::SendToPeer { data, .. } = ev {
-                            let _ = tls.writer().write_all(data);
-                        }
-                    }
+                    dispatch_events(&events, &mut peers);
                     did_work = true;
                 }
             }
 
-            // ── 4. Flush TLS write buffer
-            while tls.wants_write() {
-                match tls.write_tls(&mut tcp) {
-                    Ok(_) => {}
-                    Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => break,
-                    Err(e) => {
-                        eprintln!("[TLS] Write error: {}", e);
-                        break;
+            // ── 3. Flush all peers' TLS write buffers ────────────────
+            for pc in peers.values_mut() {
+                while pc.tls.wants_write() {
+                    match pc.tls.write_tls(&mut pc.tcp) {
+                        Ok(_) => {}
+                        Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                        Err(e) => {
+                            eprintln!("[TLS] Peer {} write error: {}", pc.addr, e);
+                            break;
+                        }
                     }
                 }
             }
 
-            // ── 5. Status output
+            // ── 4. Status output ─────────────────────────────────────
             if now_ms.saturating_sub(last_status) >= 30_000 {
                 last_status = now_ms;
                 eprintln!(
@@ -1065,91 +1135,108 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let start = Instant::now();
         let mut last_poll: u64 = 0;
         let mut last_status: u64 = 0;
-        let mut tls_read_buf = vec![0u8; 65536];
         let mut http_buf: Vec<u8> = Vec::new();
+        let mut disconnected: Vec<PeerId> = Vec::new();
 
         loop {
             let now_ms = start.elapsed().as_millis() as u64;
             let smol_now = SmolInstant::now();
             let mut did_work = false;
 
-            // ── 1. Read new TLS records from TCP
-            match tls.read_tls(&mut tcp) {
-                Ok(0) => {
-                    eprintln!("[CONN] Peer disconnected (EOF)");
-                    break;
-                }
-                Ok(_n) => {
-                    match tls.process_new_packets() {
-                        Ok(_) => {}
-                        Err(e) => {
-                            eprintln!("[TLS] Error: {}", e);
-                            break;
+            // ── 1. Read from all peers ───────────────────────────────
+            // Phase 1: TLS read + decrypt into per-peer accumulated data
+            disconnected.clear();
+            let peer_ids: Vec<PeerId> = peers.keys().copied().collect();
+            let mut peer_data: Vec<(PeerId, Vec<u8>)> = Vec::new();
+
+            for &pid in &peer_ids {
+                let pc = peers.get_mut(&pid).unwrap();
+
+                match pc.tls.read_tls(&mut pc.tcp) {
+                    Ok(0) => {
+                        eprintln!("[CONN] Peer {} disconnected (EOF)", pc.addr);
+                        disconnected.push(pid);
+                        continue;
+                    }
+                    Ok(_) => {
+                        match pc.tls.process_new_packets() {
+                            Ok(_) => {}
+                            Err(e) => {
+                                eprintln!("[TLS] Peer {} error: {}", pc.addr, e);
+                                disconnected.push(pid);
+                                continue;
+                            }
                         }
                     }
+                    Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {}
+                    Err(e) => {
+                        eprintln!("[CONN] Peer {} read error: {}", pc.addr, e);
+                        disconnected.push(pid);
+                        continue;
+                    }
                 }
-                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {}
-                Err(e) => {
-                    eprintln!("[CONN] Read error: {}", e);
-                    break;
+
+                // Consume decrypted data from TLS reader into a buffer
+                let mut accum = Vec::new();
+                loop {
+                    match pc.tls.reader().read(&mut pc.tls_read_buf) {
+                        Ok(0) => break,
+                        Ok(n) => accum.extend_from_slice(&pc.tls_read_buf[..n]),
+                        Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                        Err(_) => break,
+                    }
+                }
+                if !accum.is_empty() {
+                    peer_data.push((pid, accum));
                 }
             }
 
-            // ── 2. Consume decrypted data → route events
-            loop {
-                match tls.reader().read(&mut tls_read_buf) {
-                    Ok(0) => break,
-                    Ok(n) => {
-                        let events = node.handle_peer_data(
-                            peer_id,
-                            &tls_read_buf[..n],
-                            now_ms,
-                            &mut OsRng,
-                        );
-                        for event in &events {
-                            match event {
-                                NodeEvent::SendToPeer { data, .. } => {
-                                    let _ = tls.writer().write_all(data);
-                                    while tls.wants_write() {
-                                        match tls.write_tls(&mut tcp) {
-                                            Ok(_) => {}
-                                            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => break,
-                                            Err(_) => break,
-                                        }
-                                    }
-                                }
-                                NodeEvent::Deliver { source, data } => {
-                                    if data.len() > 1 && data[0] == TYPE_SESSION_TRAFFIC {
-                                        let ipv6_packet = &data[1..];
+            // Phase 2: Process accumulated data (no borrow on peers)
+            for (pid, data) in &peer_data {
+                let events = node.handle_peer_data(*pid, data, now_ms, &mut OsRng);
+                for event in &events {
+                    match event {
+                        NodeEvent::SendToPeer { peer_id, data } => {
+                            send_to_peer(&mut peers, *peer_id, data);
+                        }
+                        NodeEvent::Deliver { source, data } => {
+                            if data.len() > 1 && data[0] == TYPE_SESSION_TRAFFIC {
+                                let ipv6_packet = &data[1..];
 
-                                        // Record source key → IPv6 mapping
-                                        let source_addr = addr_for_key(source);
-                                        let source_ipv6 = bytes_to_ipv6(&source_addr.0);
-                                        addr_to_key.insert(source_ipv6, *source);
+                                let source_addr = addr_for_key(source);
+                                let source_ipv6 = bytes_to_ipv6(&source_addr.0);
+                                addr_to_key.insert(source_ipv6, *source);
 
-                                        eprintln!(
-                                            "[RECV] {} bytes from {}",
-                                            ipv6_packet.len(),
-                                            source_ipv6
-                                        );
+                                eprintln!(
+                                    "[RECV] {} bytes from {}",
+                                    ipv6_packet.len(),
+                                    source_ipv6
+                                );
 
-                                        // Feed to smoltcp — ICMPv6 handled automatically
-                                        device.push_rx(ipv6_packet.to_vec());
-                                    } else if !data.is_empty() {
-                                        eprintln!(
-                                            "[RECV] Non-traffic data ({} bytes, type=0x{:02x})",
-                                            data.len(),
-                                            data[0]
-                                        );
-                                    }
-                                }
+                                device.push_rx(ipv6_packet.to_vec());
+                            } else if !data.is_empty() {
+                                eprintln!(
+                                    "[RECV] Non-traffic data ({} bytes, type=0x{:02x})",
+                                    data.len(),
+                                    data[0]
+                                );
                             }
                         }
-                        did_work = true;
                     }
-                    Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => break,
-                    Err(_) => break,
                 }
+                did_work = true;
+            }
+
+            // Remove disconnected peers
+            for pid in &disconnected {
+                node.remove_peer(*pid);
+                if let Some(pc) = peers.remove(pid) {
+                    eprintln!("[CONN] Removed peer {} (id={})", pc.addr, pid);
+                }
+            }
+            if peers.is_empty() {
+                eprintln!("[CONN] All peers disconnected, exiting");
+                break;
             }
 
             // ── 3. smoltcp poll (processes rx, generates tx)
@@ -1163,18 +1250,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     payload.extend_from_slice(&pkt);
 
                     let send_events = node.send(&dest_key, &payload, now_ms, &mut OsRng);
-                    for sev in &send_events {
-                        if let NodeEvent::SendToPeer { data, .. } = sev {
-                            let _ = tls.writer().write_all(data);
-                            while tls.wants_write() {
-                                match tls.write_tls(&mut tcp) {
-                                    Ok(_) => {}
-                                    Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => break,
-                                    Err(_) => break,
-                                }
-                            }
-                        }
-                    }
+                    dispatch_events(&send_events, &mut peers);
                     did_work = true;
                 }
             }
@@ -1234,18 +1310,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     payload.extend_from_slice(&pkt);
 
                     let send_events = node.send(&dest_key, &payload, now_ms, &mut OsRng);
-                    for sev in &send_events {
-                        if let NodeEvent::SendToPeer { data, .. } = sev {
-                            let _ = tls.writer().write_all(data);
-                            while tls.wants_write() {
-                                match tls.write_tls(&mut tcp) {
-                                    Ok(_) => {}
-                                    Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => break,
-                                    Err(_) => break,
-                                }
-                            }
-                        }
-                    }
+                    dispatch_events(&send_events, &mut peers);
                     did_work = true;
                 }
             }
@@ -1255,23 +1320,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 last_poll = now_ms;
                 let events = node.poll(now_ms, &mut OsRng);
                 if !events.is_empty() {
-                    for ev in &events {
-                        if let NodeEvent::SendToPeer { data, .. } = ev {
-                            let _ = tls.writer().write_all(data);
-                        }
-                    }
+                    dispatch_events(&events, &mut peers);
                     did_work = true;
                 }
             }
 
-            // ── 8. Flush TLS write buffer
-            while tls.wants_write() {
-                match tls.write_tls(&mut tcp) {
-                    Ok(_) => {}
-                    Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => break,
-                    Err(e) => {
-                        eprintln!("[TLS] Write error: {}", e);
-                        break;
+            // ── 8. Flush all peers' TLS write buffers
+            for pc in peers.values_mut() {
+                while pc.tls.wants_write() {
+                    match pc.tls.write_tls(&mut pc.tcp) {
+                        Ok(_) => {}
+                        Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                        Err(e) => {
+                            eprintln!("[TLS] Peer {} write error: {}", pc.addr, e);
+                            break;
+                        }
                     }
                 }
             }
@@ -1299,11 +1362,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[cfg(not(feature = "smoltcp"))]
-/// Process node events: send frames to TLS, deliver IPv6 packets to mini TCP.
+/// Process node events: send frames to the correct peer, deliver IPv6 packets to mini TCP.
 fn process_events(
     events: &[NodeEvent],
-    tls: &mut ClientConnection,
-    tcp: &mut TcpStream,
+    peers: &mut HashMap<PeerId, PeerConn>,
     mini_tcp: &mut MiniTcp,
     addr_to_key: &mut HashMap<Ipv6Addr, PublicKey>,
     node: &mut YggdrasilLite,
@@ -1311,15 +1373,8 @@ fn process_events(
 ) {
     for event in events {
         match event {
-            NodeEvent::SendToPeer { data, .. } => {
-                let _ = tls.writer().write_all(data);
-                while tls.wants_write() {
-                    match tls.write_tls(tcp) {
-                        Ok(_) => {}
-                        Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => break,
-                        Err(_) => break,
-                    }
-                }
+            NodeEvent::SendToPeer { peer_id, data } => {
+                send_to_peer(peers, *peer_id, data);
             }
             NodeEvent::Deliver { source, data } => {
                 // Strip TYPE_SESSION_TRAFFIC prefix
@@ -1343,30 +1398,13 @@ fn process_events(
                         if let Some(dest_key) =
                             get_dest_key_from_ipv6(&resp_pkt, addr_to_key)
                         {
-                            // Prepend TYPE_SESSION_TRAFFIC and send
                             let mut payload = Vec::with_capacity(1 + resp_pkt.len());
                             payload.push(TYPE_SESSION_TRAFFIC);
                             payload.extend_from_slice(&resp_pkt);
 
                             let send_events =
                                 node.send(&dest_key, &payload, now_ms, &mut OsRng);
-                            // Handle send events (write to TLS)
-                            for sev in &send_events {
-                                if let NodeEvent::SendToPeer { data, .. } = sev {
-                                    let _ = tls.writer().write_all(data);
-                                    while tls.wants_write() {
-                                        match tls.write_tls(tcp) {
-                                            Ok(_) => {}
-                                            Err(ref e)
-                                                if e.kind() == io::ErrorKind::WouldBlock =>
-                                            {
-                                                break
-                                            }
-                                            Err(_) => break,
-                                        }
-                                    }
-                                }
-                            }
+                            dispatch_events(&send_events, peers);
                         }
                     }
                 } else if !data.is_empty() {
