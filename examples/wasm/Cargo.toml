@@ -1,0 +1,36 @@
+[package]
+name = "yggdrasil-wasm"
+version = "0.1.0"
+edition = "2021"
+description = "Yggdrasil leaf node running in the browser via WASM + WebSocket"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+yggdrasil-lite = { path = "../..", default-features = false }
+smoltcp = { version = "0.12", default-features = false, features = [
+    "alloc",
+    "proto-ipv6",
+    "socket-tcp",
+    "socket-icmp",
+    "medium-ip",
+] }
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+web-sys = { version = "0.3", features = [
+    "WebSocket",
+    "BinaryType",
+    "MessageEvent",
+    "ErrorEvent",
+    "CloseEvent",
+    "Performance",
+    "Window",
+    "console",
+] }
+js-sys = "0.3"
+getrandom = { version = "0.2", features = ["js"] }
+rand = "0.8"
+ed25519-dalek = { version = "2", default-features = false }
+rand_core = { version = "0.6" }

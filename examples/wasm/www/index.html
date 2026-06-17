@@ -1,0 +1,82 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Yggdrasil WASM Node</title>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body { font-family: monospace; background: #1a1a2e; color: #e0e0e0; padding: 20px; }
+        h1 { color: #0f3460; margin-bottom: 20px; }
+        .section { background: #16213e; border-radius: 8px; padding: 16px; margin-bottom: 16px; }
+        .section h2 { color: #53a8b6; font-size: 14px; margin-bottom: 8px; }
+        label { display: block; margin-bottom: 4px; font-size: 12px; color: #888; }
+        input, button { font-family: monospace; font-size: 14px; padding: 8px 12px; border: 1px solid #333; border-radius: 4px; background: #0f3460; color: #e0e0e0; }
+        input { width: 100%; margin-bottom: 8px; }
+        button { cursor: pointer; margin-right: 8px; margin-bottom: 4px; }
+        button:hover { background: #1a4a80; }
+        button:disabled { opacity: 0.5; cursor: not-allowed; }
+        .info { font-size: 13px; margin: 4px 0; word-break: break-all; }
+        .info span { color: #53a8b6; }
+        #log { background: #0a0a1a; border-radius: 4px; padding: 12px; height: 300px; overflow-y: auto; font-size: 12px; line-height: 1.6; white-space: pre-wrap; }
+        .log-entry { border-bottom: 1px solid #1a1a2e; padding: 2px 0; }
+    </style>
+</head>
+<body>
+    <h1>Yggdrasil WASM Node</h1>
+
+    <div class="section">
+        <h2>Node Info</h2>
+        <div class="info">Address: <span id="node-addr">-</span></div>
+        <div class="info">Public Key: <span id="node-key">-</span></div>
+        <div class="info">Coords: <span id="node-coords">-</span></div>
+        <div class="info">Peers: <span id="node-peers">0</span> | Sessions: <span id="node-sessions">0</span> | Paths: <span id="node-paths">0</span></div>
+        <div class="info">Status: <span id="node-status">-</span></div>
+    </div>
+
+    <div class="section">
+        <h2>Connect to Peer</h2>
+        <label>WebSocket URL (peer must have wss:// listener enabled)</label>
+        <input type="text" id="peer-url" placeholder="wss://peer.example.com:443"
+        value="wss://ygg.cleverfox.org/yws" />
+        <button id="btn-connect">Connect</button>
+    </div>
+
+    <div class="section">
+        <h2>Ping (ICMPv6 Echo)</h2>
+        <label>Destination Yggdrasil IPv6 address (key is discovered automatically)</label>
+        <input type="text" id="ping-dest" placeholder="200:abcd::1" />
+        <button id="btn-ping">Ping</button>
+        <button id="btn-ping5">Ping x5</button>
+        <div class="info">Result: <span id="ping-result">-</span></div>
+    </div>
+
+    <div class="section">
+        <h2>HTTP Server (port 80)</h2>
+        <label>Response body — returned for any request</label>
+        <input type="text" id="http-body" value="ACK from yggdrasil-lite in wasm" />
+        <button id="btn-http-start">Start Server</button>
+        <button id="btn-http-update">Update Response</button>
+        <div class="info">Serving at: <span id="http-url">-</span></div>
+    </div>
+
+    <div class="section">
+        <h2>TCP (via smoltcp over Yggdrasil)</h2>
+        <label>Destination IPv6:port</label>
+        <input type="text" id="tcp-dest" placeholder="200:abcd::1:80" />
+        <button id="btn-tcp-connect">TCP Connect</button>
+        <div class="info">TCP State: <span id="tcp-state">-</span></div>
+        <br>
+        <label>Send data</label>
+        <input type="text" id="tcp-data" placeholder="GET / HTTP/1.0&#10;&#10;" />
+        <button id="btn-tcp-send">Send</button>
+    </div>
+
+    <div class="section">
+        <h2>Log <label style="display:inline; color:#888; font-size:12px; margin-left:8px;"><input type="checkbox" id="verbose-log" style="width:auto; margin:0 4px 0 0; vertical-align:middle;">verbose</label></h2>
+        <div id="log"></div>
+    </div>
+
+    <script type="module" src="app.js"></script>
+</body>
+</html>
