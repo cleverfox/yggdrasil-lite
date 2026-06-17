@@ -449,11 +449,12 @@ impl YggdrasilLite {
         };
 
         // Accept the notify into our pathfinder.
-        // source = the key that originally replied, dest = us
-        // xformed_source = same as source for now (no key transform)
+        // source = the key that originally replied (full key).
+        // xformed_source must match the rumor created at lookup time, which is
+        // keyed by the bloom transform of the destination.
         self.pathfinder.accept_notify(
             notify.source,
-            notify.source,
+            bloom_transform(notify.source),
             notify.info.seq,
             notify.info.path,
             now_ms,
@@ -600,6 +601,13 @@ impl YggdrasilLite {
 
         self.pathfinder.mark_lookup_sent(dest, now_ms);
 
+        // Register a rumor keyed by the bloom-transformed destination so the
+        // PathNotify reply is accepted. The transform is identical for the
+        // partial key derived from an address and the responder's full key,
+        // which is what lets address-initiated lookups resolve to a full key.
+        self.pathfinder
+            .ensure_rumor(bloom_transform(*dest), now_ms);
+
         let our_coords = self.tree.get_coords();
         let lookup = wire::PathLookup {
             source: self.crypto.public_key,
@@ -665,8 +673,13 @@ impl YggdrasilLite {
             self.tree.set_needs_refresh();
         }
 
-        // Tree maintenance
-        if now_ms.saturating_sub(self.last_tree_tick) >= TREE_INTERVAL_MS || self.last_tree_tick == 0
+        // Tree maintenance. Runs on the periodic tick, on the very first poll,
+        // or whenever the tree needs a refresh (new peer, fresh SigRes) so a
+        // freshly connected leaf converges within a poll cycle instead of
+        // waiting up to a full tree interval.
+        if now_ms.saturating_sub(self.last_tree_tick) >= TREE_INTERVAL_MS
+            || self.last_tree_tick == 0
+            || self.tree.needs_refresh()
         {
             self.last_tree_tick = now_ms;
             let nonce = random_nonce(rng);

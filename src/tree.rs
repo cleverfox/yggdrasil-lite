@@ -293,6 +293,11 @@ impl LeafTree {
             port: res.port,
             psig: res.psig,
         });
+        // A new response lets us (re)evaluate parent selection. Flag a refresh
+        // so the next maintenance pass runs promptly instead of waiting for the
+        // periodic tick — this is what lets a freshly connected leaf adopt a
+        // parent and obtain coordinates within a poll cycle rather than ~30s.
+        self.needs_refresh = true;
     }
 
     // -----------------------------------------------------------------------
@@ -743,6 +748,13 @@ impl LeafTree {
     /// Mark that a refresh is needed (call when timer expires).
     pub fn set_needs_refresh(&mut self) {
         self.needs_refresh = true;
+    }
+
+    /// Whether the tree wants a maintenance pass before the next periodic tick
+    /// (e.g. a peer was just added or a new SigRes arrived). Lets the caller's
+    /// `poll` converge promptly instead of waiting for the tree interval.
+    pub fn needs_refresh(&self) -> bool {
+        self.needs_refresh
     }
 }
 
