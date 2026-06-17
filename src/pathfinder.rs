@@ -190,6 +190,13 @@ impl LeafPathfinder {
         self.paths.len()
     }
 
+    /// Iterate over the full public keys of all cached paths (including broken
+    /// ones). Useful for resolving an IPv6 address back to a full public key
+    /// once a path to the owning node has been learned.
+    pub fn known_keys(&self) -> impl Iterator<Item = &PublicKey> + '_ {
+        self.paths.iter().map(|(k, _)| k)
+    }
+
     /// Number of pending rumors.
     pub fn rumor_count(&self) -> usize {
         self.rumors.len()
@@ -533,6 +540,29 @@ mod tests {
         pf.handle_broken(&dest);
         assert!(pf.get_path(&dest).is_none()); // broken → not returned
         assert!(pf.has_path(&dest)); // but entry still exists
+    }
+
+    #[test]
+    fn known_keys_lists_learned_paths() {
+        let crypto = make_crypto();
+        let mut pf = LeafPathfinder::new(&crypto);
+        assert_eq!(pf.known_keys().count(), 0);
+
+        let a = [1u8; 32];
+        let b = [2u8; 32];
+        pf.ensure_rumor(a, 0);
+        pf.accept_notify(a, a, 1, vec![1], 100);
+        pf.ensure_rumor(b, 0);
+        pf.accept_notify(b, b, 1, vec![2], 100);
+
+        let keys: alloc::vec::Vec<_> = pf.known_keys().copied().collect();
+        assert_eq!(keys.len(), 2);
+        assert!(keys.contains(&a));
+        assert!(keys.contains(&b));
+
+        // Broken paths are still listed (the key remains resolvable).
+        pf.handle_broken(&a);
+        assert_eq!(pf.known_keys().count(), 2);
     }
 
     #[test]

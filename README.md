@@ -155,6 +155,25 @@ cargo run --example lite_node -p yggdrasil-lite -- 127.0.0.1:2020
 curl -6 --max-time 30 "http://[<lite_ipv6>]:80/hello"
 ```
 
+### Desktop: `tun` bridge (Linux / macOS)
+
+Bridges the overlay to a real kernel **TUN interface**, so the host's own stack
+can reach the mesh (`ping6`, `curl -6`, `ssh`, …) — not just a single userspace
+HTTP endpoint. Needs root to create the device and add a route.
+
+```sh
+# Connect to a yggdrasil-ng / yggstack TLS peer and bring up the bridge
+sudo cargo run --release -p yggdrasil-tun -- 127.0.0.1:2020
+
+# From this host, reach any node on the mesh:
+ping6 <a-yggdrasil-address>
+```
+
+See [`examples/tun/`](examples/tun/) for details. It uses two small APIs for
+address-initiated traffic: `YggdrasilLite::lookup()` (start path discovery from
+a partial key derived from an IPv6 address) and `YggdrasilLite::resolve()`
+(map a learned address back to a full public key).
+
 ### ESP32: Yggdrasil TCP-UART Bridge
 
 A firmware for ESP32 (C6 and and 32D) that bridges TCP connections over the Yggdrasil mesh to a hardware UART. The device connects to WiFi, establishes a TLS connection to Yggdrasil peers, and listens for TCP and ICMPv6 on its overlay IPv6 address. Target chip is selected via Cargo features.

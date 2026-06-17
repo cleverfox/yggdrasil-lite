@@ -552,6 +552,40 @@ impl YggdrasilLite {
     }
 
     /// Initiate a path lookup for a destination key.
+    ///
+    /// `dest` may be a *partial* key reconstructed from an IPv6 address via
+    /// [`Address::get_key`](crate::address::Address::get_key): the bloom/DHT
+    /// machinery matches on the address transform, so a partial key is enough
+    /// to reach the target node, which replies with its full public key in a
+    /// PathNotify. Use this when bridging a TUN interface to start discovering
+    /// a destination whose full key is not yet known; once the reply arrives,
+    /// [`resolve`](Self::resolve) returns the full key.
+    pub fn lookup(&mut self, dest: &PublicKey, now_ms: u64) -> Vec<NodeEvent> {
+        self.initiate_path_lookup(dest, now_ms)
+    }
+
+    /// Resolve a Yggdrasil IPv6 address (16 bytes) to a full Ed25519 public
+    /// key, if a path to the owning node has been learned — either from
+    /// inbound traffic or from a PathNotify reply to [`lookup`](Self::lookup).
+    /// Returns `None` if the key is not yet known.
+    ///
+    /// Handles both `200::/8` node `/128` addresses and `300::/8` subnet
+    /// prefixes (only the first 8 bytes are matched for subnets).
+    pub fn resolve(&self, addr: &[u8; 16]) -> Option<PublicKey> {
+        let is_subnet = addr[0] == 0x03;
+        self.pathfinder
+            .known_keys()
+            .find(|k| {
+                if is_subnet {
+                    address::subnet_for_key(k).0[..] == addr[..8]
+                } else {
+                    address::addr_for_key(k).0 == *addr
+                }
+            })
+            .copied()
+    }
+
+    /// Initiate a path lookup for a destination key.
     fn initiate_path_lookup(
         &mut self,
         dest: &PublicKey,
