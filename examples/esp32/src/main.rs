@@ -33,11 +33,13 @@ use esp_bootloader_esp_idf::partitions;
 use esp_hal::{
     clock::CpuClock,
     interrupt::software::SoftwareInterruptControl,
-    ram,
     rng::Rng,
     timer::timg::TimerGroup,
     uart::{self, Uart},
 };
+// `ram` is only used by the ESP32 (Xtensa) reclaimed-heap attribute.
+#[cfg(feature = "esp32")]
+use esp_hal::ram;
 use esp_hal_dhcp_server::simple_leaser::SimpleDhcpLeaser;
 use esp_hal_dhcp_server::structs::DhcpServerConfig;
 use esp_println::println;
@@ -827,7 +829,11 @@ impl MiniTcpUart {
                 if tcp.flags & TCP_ACK != 0 && tcp.flags & TCP_SYN == 0 {
                     self.state = TcpState::Established;
                     UART_CONNECTED.store(true, Ordering::Relaxed);
-                    log::info!("TCP connection established from overlay peer");
+                    log::info!(
+                        "TCP connection established from overlay peer [{}]:{}",
+                        format_ipv6(&self.remote_addr),
+                        self.remote_port,
+                    );
 
                     if !payload.is_empty() {
                         self.their_seq = self.their_seq.wrapping_add(payload.len() as u32);
@@ -1146,6 +1152,13 @@ async fn main(spawner: Spawner) -> ! {
     // stack overflow (heap too large) and OOM (heap too small).
     #[cfg(feature = "esp32")]
     esp_alloc::heap_allocator!(#[ram(reclaimed)] size: 96 * 1024);
+    // ESP32-S3: the heap static lives in .bss and the task stack takes
+    // whatever RWDATA is left after it, so keep the heap modest — the
+    // Ed25519 verify (curve25519-dalek) needs a deep stack frame. 96 KiB
+    // heap leaves ~100 KiB of stack, which clears it; do NOT crank this up
+    // (a 200 KiB heap starves the stack and panics in verify).
+    #[cfg(feature = "esp32s3")]
+    esp_alloc::heap_allocator!(size: 96 * 1024);
 
     // ── Load/generate Yggdrasil key ────────────────────────────────────
     let mut flash = FlashStorage::new(peripherals.FLASH);
@@ -1250,6 +1263,9 @@ async fn main(spawner: Spawner) -> ! {
     let (uart_rx_pin, uart_tx_pin) = (peripherals.GPIO20, peripherals.GPIO19);
     #[cfg(feature = "esp32")]
     let (uart_rx_pin, uart_tx_pin) = (peripherals.GPIO16, peripherals.GPIO17);
+    // ESP32-S3: free GPIOs clear of the USB-serial-JTAG console; adjust per board.
+    #[cfg(feature = "esp32s3")]
+    let (uart_rx_pin, uart_tx_pin) = (peripherals.GPIO18, peripherals.GPIO17);
 
     let uart = Uart::new(peripherals.UART1, uart_config)
         .unwrap()
@@ -1838,12 +1854,14 @@ async fn connect_and_run_peers<'b>(
             if now_ms.saturating_sub(last_status_ms) >= 30_000 {
                 last_status_ms = now_ms;
                 log::info!(
-                    "uptime={}s peers={} sessions={} paths={} uart={}",
+                    "uptime={}s peers={} sessions={} paths={} uart={} heap_free={} heap_used={}",
                     now_ms / 1000,
                     node.peer_count(),
                     node.session_count(),
                     node.path_count(),
                     if UART_CONNECTED.load(Ordering::Relaxed) { "connected" } else { "idle" },
+                    esp_alloc::HEAP.free(),
+                    esp_alloc::HEAP.used(),
                 );
             }
         }
@@ -2054,12 +2072,14 @@ async fn connect_and_run_peers<'b>(
             if now_ms.saturating_sub(last_status_ms) >= 30_000 {
                 last_status_ms = now_ms;
                 log::info!(
-                    "uptime={}s peers={} sessions={} paths={} uart={}",
+                    "uptime={}s peers={} sessions={} paths={} uart={} heap_free={} heap_used={}",
                     now_ms / 1000,
                     node.peer_count(),
                     node.session_count(),
                     node.path_count(),
                     if UART_CONNECTED.load(Ordering::Relaxed) { "connected" } else { "idle" },
+                    esp_alloc::HEAP.free(),
+                    esp_alloc::HEAP.used(),
                 );
             }
         }

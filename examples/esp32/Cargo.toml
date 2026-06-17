@@ -79,6 +79,14 @@ esp32 = [
     "esp-radio/esp32",
     "esp-storage/esp32",
 ]
+esp32s3 = [
+    "esp-backtrace/esp32s3",
+    "esp-bootloader-esp-idf/esp32s3",
+    "esp-hal/esp32s3",
+    "esp-rtos/esp32s3",
+    "esp-radio/esp32s3",
+    "esp-storage/esp32s3",
+]
 
 [profile.dev]
 opt-level = 2
