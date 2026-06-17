@@ -986,6 +986,198 @@ impl MiniTcpUart {
 }
 
 // ============================================================================
+// Mini HTTP server over the overlay (serves one static page on port 80)
+// ============================================================================
+
+/// Static page served by the overlay HTTP server (both TCP paths).
+const HTTP_PAGE: &str = "This page is served from an ESP32 over \
+<a href=\"https://github.com/cleverfox/yggdrasil-lite/\">yggdrasil-lite</a>";
+
+/// smoltcp HTTP server: number of listener sockets kept armed in parallel
+/// (allows that many concurrent connections), and how long a connection may
+/// stay open without completing a request before it's reclaimed.
+#[cfg(feature = "smoltcp")]
+const HTTP_LISTENERS: usize = 4;
+#[cfg(feature = "smoltcp")]
+const HTTP_IDLE_MS: u64 = 10_000;
+
+/// One HTTP listener/connection slot in the smoltcp pool.
+#[cfg(feature = "smoltcp")]
+struct HttpSlot {
+    handle: smoltcp::iface::SocketHandle,
+    req: Vec<u8>,
+    active_since: u64,
+}
+
+#[cfg(not(feature = "smoltcp"))]
+struct MiniTcpHttp {
+    our_addr: [u8; 16],
+    state: TcpState,
+    remote_addr: [u8; 16],
+    remote_port: u16,
+    local_port: u16,
+    our_seq: u32,
+    their_seq: u32,
+    req: Vec<u8>,
+}
+
+#[cfg(not(feature = "smoltcp"))]
+impl MiniTcpHttp {
+    fn new(our_addr: [u8; 16], port: u16) -> Self {
+        let mut isn = [0u8; 4];
+        EspRng.fill_bytes(&mut isn);
+        Self {
+            our_addr,
+            state: TcpState::Listen,
+            remote_addr: [0; 16],
+            remote_port: 0,
+            local_port: port,
+            our_seq: u32::from_be_bytes(isn),
+            their_seq: 0,
+            req: Vec::new(),
+        }
+    }
+
+    fn handle_packet(&mut self, ipv6_packet: &[u8]) -> Vec<Vec<u8>> {
+        let mut responses = Vec::new();
+        let (ip, tcp_data) = match parse_ipv6(ipv6_packet) {
+            Some(v) => v,
+            None => return responses,
+        };
+        if ip.next_header != 6 {
+            return responses;
+        }
+        let (tcp, payload) = match parse_tcp(tcp_data) {
+            Some(v) => v,
+            None => return responses,
+        };
+        if tcp.dst_port != self.local_port {
+            return responses;
+        }
+
+        match self.state {
+            TcpState::Listen => {
+                if tcp.flags & TCP_SYN != 0 && tcp.flags & TCP_ACK == 0 {
+                    self.remote_addr = ip.src;
+                    self.remote_port = tcp.src_port;
+                    self.their_seq = tcp.seq.wrapping_add(1);
+                    self.req.clear();
+                    let mss_opt = [0x02, 0x04, 0x05, 0xA0]; // MSS=1440
+                    responses.push(build_ipv6_tcp(
+                        &self.our_addr, &self.remote_addr, self.local_port, self.remote_port,
+                        self.our_seq, self.their_seq, TCP_SYN | TCP_ACK, &mss_opt, &[],
+                    ));
+                    self.our_seq = self.our_seq.wrapping_add(1);
+                    self.state = TcpState::SynReceived;
+                }
+            }
+            TcpState::SynReceived => {
+                if tcp.flags & TCP_ACK != 0 && tcp.flags & TCP_SYN == 0 {
+                    self.state = TcpState::Established;
+                    if !payload.is_empty() {
+                        self.feed(payload, &mut responses);
+                    }
+                }
+            }
+            TcpState::Established => {
+                if tcp.flags & TCP_RST != 0 {
+                    self.reset();
+                    return responses;
+                }
+                if !payload.is_empty() {
+                    self.feed(payload, &mut responses);
+                }
+                if tcp.flags & TCP_FIN != 0 {
+                    self.their_seq = self.their_seq.wrapping_add(1);
+                    responses.push(build_ipv6_tcp(
+                        &self.our_addr, &self.remote_addr, self.local_port, self.remote_port,
+                        self.our_seq, self.their_seq, TCP_ACK, &[], &[],
+                    ));
+                    self.reset();
+                }
+            }
+            TcpState::FinWait1 => {
+                if tcp.flags & TCP_ACK != 0 {
+                    if tcp.flags & TCP_FIN != 0 {
+                        self.their_seq = self.their_seq.wrapping_add(1);
+                        responses.push(build_ipv6_tcp(
+                            &self.our_addr, &self.remote_addr, self.local_port, self.remote_port,
+                            self.our_seq, self.their_seq, TCP_ACK, &[], &[],
+                        ));
+                        self.reset();
+                    } else {
+                        self.state = TcpState::FinWait2;
+                    }
+                }
+            }
+            TcpState::FinWait2 => {
+                if tcp.flags & TCP_FIN != 0 {
+                    self.their_seq = self.their_seq.wrapping_add(1);
+                    responses.push(build_ipv6_tcp(
+                        &self.our_addr, &self.remote_addr, self.local_port, self.remote_port,
+                        self.our_seq, self.their_seq, TCP_ACK, &[], &[],
+                    ));
+                    self.reset();
+                }
+            }
+            TcpState::Closed => {}
+        }
+        responses
+    }
+
+    /// Accumulate request bytes; once the headers are complete, reply with the
+    /// static page and a FIN in one segment.
+    fn feed(&mut self, payload: &[u8], responses: &mut Vec<Vec<u8>>) {
+        self.their_seq = self.their_seq.wrapping_add(payload.len() as u32);
+        self.req.extend_from_slice(payload);
+
+        if !self.req.windows(4).any(|w| w == b"\r\n\r\n") {
+            // Request not complete yet — ACK what we have and wait.
+            responses.push(build_ipv6_tcp(
+                &self.our_addr, &self.remote_addr, self.local_port, self.remote_port,
+                self.our_seq, self.their_seq, TCP_ACK, &[], &[],
+            ));
+            return;
+        }
+
+        let body = HTTP_PAGE.as_bytes();
+        let mut resp = alloc::format!(
+            "HTTP/1.1 200 OK\r\n\
+             Content-Type: text/html; charset=utf-8\r\n\
+             Content-Length: {}\r\n\
+             Connection: close\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        resp.extend_from_slice(body);
+
+        responses.push(build_ipv6_tcp(
+            &self.our_addr, &self.remote_addr, self.local_port, self.remote_port,
+            self.our_seq, self.their_seq, TCP_PSH | TCP_ACK | TCP_FIN, &[], &resp,
+        ));
+        self.our_seq = self.our_seq.wrapping_add(resp.len() as u32 + 1); // data + FIN
+        self.req.clear();
+        self.state = TcpState::FinWait1;
+        log::info!(
+            "HTTP page served to [{}]:{}",
+            format_ipv6(&self.remote_addr),
+            self.remote_port,
+        );
+    }
+
+    fn reset(&mut self) {
+        self.state = TcpState::Listen;
+        self.remote_addr = [0; 16];
+        self.remote_port = 0;
+        self.req.clear();
+        let mut isn = [0u8; 4];
+        EspRng.fill_bytes(&mut isn);
+        self.our_seq = u32::from_be_bytes(isn);
+        self.their_seq = 0;
+    }
+}
+
+// ============================================================================
 // smoltcp Device (used when smoltcp feature is enabled)
 // ============================================================================
 
@@ -1153,12 +1345,14 @@ async fn main(spawner: Spawner) -> ! {
     #[cfg(feature = "esp32")]
     esp_alloc::heap_allocator!(#[ram(reclaimed)] size: 96 * 1024);
     // ESP32-S3: the heap static lives in .bss and the task stack takes
-    // whatever RWDATA is left after it, so keep the heap modest — the
-    // Ed25519 verify (curve25519-dalek) needs a deep stack frame. 96 KiB
-    // heap leaves ~100 KiB of stack, which clears it; do NOT crank this up
-    // (a 200 KiB heap starves the stack and panics in verify).
+    // whatever RWDATA is left after it — the two trade off. Measured: 150 KiB
+    // heap leaves ~70 KiB of stack. That clears the Ed25519 verify frame
+    // (curve25519-dalek; it overflowed only at ~20 KiB) while giving the
+    // smoltcp build enough heap (Interface + socket pool) to survive the
+    // initial announce flood. Don't push the heap much higher or the stack
+    // gets too small for verify.
     #[cfg(feature = "esp32s3")]
-    esp_alloc::heap_allocator!(size: 96 * 1024);
+    esp_alloc::heap_allocator!(size: 150 * 1024);
 
     // ── Load/generate Yggdrasil key ────────────────────────────────────
     let mut flash = FlashStorage::new(peripherals.FLASH);
@@ -1775,6 +1969,7 @@ async fn connect_and_run_peers<'b>(
     #[cfg(not(feature = "smoltcp"))]
     {
         let mut mini_tcp = MiniTcpUart::new(*our_addr, listen_port);
+        let mut http_tcp = MiniTcpHttp::new(*our_addr, HTTP_PORT);
         let mut last_poll_ms: u64 = 0;
         let mut last_status_ms: u64 = 0;
         let start = embassy_time::Instant::now();
@@ -1809,7 +2004,8 @@ async fn connect_and_run_peers<'b>(
                 for (pid, data) in &incoming {
                     let events = node.handle_peer_data(*pid, data, now_ms, &mut EspRng);
                     process_ygg_events(
-                        &events, &mut peers, &mut mini_tcp, addr_to_key, node, our_addr, now_ms,
+                        &events, &mut peers, &mut mini_tcp, &mut http_tcp, addr_to_key, node,
+                        our_addr, now_ms,
                     )
                     .await;
                 }
@@ -1896,16 +2092,38 @@ async fn connect_and_run_peers<'b>(
         let tcp_tx_buf = tcp::SocketBuffer::new(alloc::vec![0u8; 1024]);
         let tcp_socket = tcp::Socket::new(tcp_rx_buf, tcp_tx_buf);
 
-        let mut socket_storage = [SocketStorage::EMPTY];
+        let mut socket_storage = [SocketStorage::EMPTY; 1 + HTTP_LISTENERS];
         let mut sockets = SocketSet::new(&mut socket_storage[..]);
         let tcp_handle = sockets.add(tcp_socket);
 
-        // Start listening
+        // Start listening (UART bridge)
         sockets
             .get_mut::<tcp::Socket>(tcp_handle)
             .listen(listen_port)
             .unwrap();
         log::info!("smoltcp: TCP listening on port {}", listen_port);
+
+        // HTTP server: a pool of listeners on port 80 so connections are served
+        // in parallel and a stalled client can't block the port.
+        let mut http_slots: Vec<HttpSlot> = Vec::new();
+        for _ in 0..HTTP_LISTENERS {
+            let s = tcp::Socket::new(
+                tcp::SocketBuffer::new(alloc::vec![0u8; 512]),
+                tcp::SocketBuffer::new(alloc::vec![0u8; 512]),
+            );
+            let h = sockets.add(s);
+            sockets.get_mut::<tcp::Socket>(h).listen(HTTP_PORT).unwrap();
+            http_slots.push(HttpSlot {
+                handle: h,
+                req: Vec::new(),
+                active_since: 0,
+            });
+        }
+        log::info!(
+            "smoltcp: HTTP listening on port {} ({} listeners)",
+            HTTP_PORT,
+            HTTP_LISTENERS
+        );
 
         let mut last_poll_ms: u64 = 0;
         let mut last_status_ms: u64 = 0;
@@ -2040,6 +2258,59 @@ async fn connect_and_run_peers<'b>(
                 }
             }
 
+            // ── 4b. HTTP server pool on port 80 (static page) ──────────
+            for slot in http_slots.iter_mut() {
+                let socket = sockets.get_mut::<tcp::Socket>(slot.handle);
+
+                // Track active duration for the idle timeout.
+                if socket.is_active() {
+                    if slot.active_since == 0 {
+                        slot.active_since = now_ms;
+                    }
+                } else {
+                    slot.active_since = 0;
+                    slot.req.clear();
+                }
+
+                if socket.can_recv() {
+                    let mut tmp = [0u8; 256];
+                    if let Ok(n) = socket.recv_slice(&mut tmp) {
+                        if n > 0 {
+                            slot.req.extend_from_slice(&tmp[..n]);
+                        }
+                    }
+                }
+
+                if socket.can_send() && slot.req.windows(4).any(|w| w == b"\r\n\r\n") {
+                    let body = HTTP_PAGE.as_bytes();
+                    let resp = alloc::format!(
+                        "HTTP/1.1 200 OK\r\n\
+                         Content-Type: text/html; charset=utf-8\r\n\
+                         Content-Length: {}\r\n\
+                         Connection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = socket.send_slice(resp.as_bytes());
+                    let _ = socket.send_slice(body);
+                    socket.close();
+                    slot.req.clear();
+                    log::info!("smoltcp: HTTP page served");
+                } else if slot.active_since != 0
+                    && now_ms.saturating_sub(slot.active_since) > HTTP_IDLE_MS
+                {
+                    // Connected but never completed a request — reclaim the slot.
+                    socket.abort();
+                }
+
+                // Re-arm any idle/closed slot.
+                if !socket.is_active() && !socket.is_listening() {
+                    socket.abort();
+                    let _ = socket.listen(HTTP_PORT);
+                    slot.req.clear();
+                    slot.active_since = 0;
+                }
+            }
+
             // ── 5. Second smoltcp poll (flushes TCP responses) ─────────
             iface.poll(smol_now, &mut device, &mut sockets);
 
@@ -2091,6 +2362,7 @@ async fn process_ygg_events<'b>(
     events: &[NodeEvent],
     peers: &mut Vec<(PeerId, embedded_tls::TlsConnection<'b, TcpSocket<'b>, embedded_tls::Aes256GcmSha384>)>,
     mini_tcp: &mut MiniTcpUart,
+    http_tcp: &mut MiniTcpHttp,
     addr_to_key: &mut Vec<(core::net::Ipv6Addr, PublicKey)>,
     node: &mut YggdrasilLite,
     our_addr: &[u8; 16],
@@ -2147,8 +2419,11 @@ async fn process_ygg_events<'b>(
                             Vec::new()
                         }
                     } else {
-                        // TCP and everything else → mini TCP stack
-                        mini_tcp.handle_packet(ipv6_packet)
+                        // TCP → HTTP server (port 80) and UART bridge (listen
+                        // port); each ignores packets not addressed to its port.
+                        let mut r = http_tcp.handle_packet(ipv6_packet);
+                        r.extend(mini_tcp.handle_packet(ipv6_packet));
+                        r
                     };
 
                     for resp_pkt in responses {
