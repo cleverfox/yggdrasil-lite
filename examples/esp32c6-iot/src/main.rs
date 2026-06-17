@@ -1,6 +1,6 @@
 //! ESP32-C6 Yggdrasil IoT Demo
 //!
-//! Boots → connects to WiFi → establishes TLS connections to Yggdrasil peers →
+//! Boots → connects to WiFi → establishes TLS connections to up to 3 Yggdrasil peers →
 //! provides a telnet CLI on port 23 with DS18B20 temperature reading and
 //! WS2812 RGB LED control, all reachable over the encrypted mesh.
 //!
@@ -53,6 +53,7 @@ use yggdrasil_lite::address::addr_for_key;
 use yggdrasil_lite::crypto::PublicKey;
 use yggdrasil_lite::meta::Metadata;
 use yggdrasil_lite::node::{LiteConfig, NodeEvent, YggdrasilLite};
+use yggdrasil_lite::peer::PeerId;
 
 esp_bootloader_esp_idf::esp_app_desc!();
 
@@ -619,7 +620,7 @@ async fn main(spawner: Spawner) -> ! {
     let config = esp_hal::Config::default().with_cpu_clock(CpuClock::max());
     let peripherals = esp_hal::init(config);
 
-    esp_alloc::heap_allocator!(size: 100 * 1024);
+    esp_alloc::heap_allocator!(size: 120 * 1024);
 
     // ── Load/generate Yggdrasil key ────────────────────────────────────
     let mut flash = FlashStorage::new(peripherals.FLASH);
@@ -968,26 +969,19 @@ async fn yggdrasil_task(
 
     log::info!("Connecting to {} peer(s)...", peer_addrs.len());
 
-    // For simplicity in the embedded context, connect to the first peer
-    // that succeeds. Multi-peer support can be added by running multiple
-    // TLS connections in parallel, but embassy_futures::select over
-    // multiple TLS readers is complex with borrowed state.
-    //
-    // We try peers in order and use the first one that connects.
+    // Allocate the per-peer buffer pool once and reuse it across reconnects.
+    let mut peer_bufs: Vec<PeerBufs> = (0..peer_addrs.len()).map(|_| PeerBufs::new()).collect();
 
-    let (peer_ip, peer_port) = peer_addrs[0];
-    log::info!("Connecting to peer {}:{}", peer_ip, peer_port);
-
-    // Retry loop for peer connection
+    // Retry loop — connect to all configured peers, run event loop
     loop {
-        match connect_and_run_peer(
+        match connect_and_run_peers(
             sta_stack,
             &mut node,
             &signing_key,
             &public_key,
             &mut addr_to_key,
-            peer_ip,
-            peer_port,
+            &peer_addrs,
+            &mut peer_bufs,
             &our_addr,
             led,
             ds_sensor,
@@ -995,7 +989,7 @@ async fn yggdrasil_task(
         .await
         {
             Ok(()) => {
-                log::info!("Peer connection ended cleanly");
+                log::info!("Peer connections ended cleanly");
             }
             Err(e) => {
                 log::error!("Peer connection error: {}", e);
@@ -1016,132 +1010,188 @@ async fn yggdrasil_task(
     }
 }
 
-async fn connect_and_run_peer(
+/// Per-peer TCP/TLS buffers, owned by the long-lived `yggdrasil_task` and
+/// reused across every reconnect. Allocated once (bounded by the peer count),
+/// so the heap usage never grows — unlike `Box::leak`, which leaked a fresh
+/// ~16 KiB per peer on every reconnect.
+struct PeerBufs {
+    tcp_rx: Vec<u8>,
+    tcp_tx: Vec<u8>,
+    tls_rb: Vec<u8>,
+    tls_wb: Vec<u8>,
+}
+
+impl PeerBufs {
+    fn new() -> Self {
+        Self {
+            tcp_rx: alloc::vec![0u8; 4096],
+            tcp_tx: alloc::vec![0u8; 4096],
+            tls_rb: alloc::vec![0u8; 4096],
+            tls_wb: alloc::vec![0u8; 4096],
+        }
+    }
+}
+
+async fn connect_and_run_peers<'b>(
     sta_stack: embassy_net::Stack<'static>,
     node: &mut YggdrasilLite,
     signing_key: &SigningKey,
     public_key: &PublicKey,
     addr_to_key: &mut Vec<(core::net::Ipv6Addr, PublicKey)>,
-    peer_ip: core::net::IpAddr,
-    peer_port: u16,
+    peer_addrs: &[(core::net::IpAddr, u16)],
+    peer_bufs: &'b mut [PeerBufs],
     our_addr: &[u8; 16],
     led: &mut ws2812::Ws2812Led<'_>,
     ds_sensor: &mut onewire::Ds18b20<'_>,
 ) -> Result<(), &'static str> {
     use embedded_tls::{Aes256GcmSha384, TlsConfig, TlsConnection, TlsContext, UnsecureProvider};
 
-    // ── TCP connect ────────────────────────────────────────────────────
-    let mut rx_buffer = [0u8; 4096];
-    let mut tx_buffer = [0u8; 4096];
-    let mut socket = TcpSocket::new(sta_stack, &mut rx_buffer, &mut tx_buffer);
-    socket.set_timeout(Some(Duration::from_secs(30)));
+    type PeerTls<'x> = TlsConnection<'x, TcpSocket<'x>, Aes256GcmSha384>;
 
-    let endpoint = match peer_ip {
-        core::net::IpAddr::V4(v4) => (v4, peer_port),
-        core::net::IpAddr::V6(_v6) => {
-            // embassy-net IPv6 connect would require different handling
-            return Err("IPv6 peer endpoints not yet supported");
-        }
-    };
-
-    socket.connect(endpoint).await.map_err(|e| {
-        log::error!("TCP connect error: {:?}", e);
-        "TCP connect failed"
-    })?;
-    log::info!("TCP connected to peer");
-
-    // ── TLS handshake ──────────────────────────────────────────────────
-    let mut tls_read_buf = [0u8; 16384];
-    let mut tls_write_buf = [0u8; 4096];
-
-    let tls_config = TlsConfig::new().with_server_name("yggdrasil");
-
-    let mut tls: TlsConnection<'_, TcpSocket<'_>, Aes256GcmSha384> =
-        TlsConnection::new(socket, &mut tls_read_buf, &mut tls_write_buf);
-
-    tls.open(TlsContext::new(
-        &tls_config,
-        UnsecureProvider::new::<Aes256GcmSha384>(EspRng),
-    ))
-    .await
-    .map_err(|e| {
-        log::error!("TLS handshake error: {:?}", e);
-        "TLS handshake failed"
-    })?;
-    log::info!("TLS handshake complete");
-
-    // ── Metadata handshake ─────────────────────────────────────────────
-    let password: &[u8] = b"";
-    let our_meta = Metadata::new(*public_key, 0);
-    let meta_bytes = our_meta.encode(signing_key, password);
-
-    tls.write_all(&meta_bytes).await.map_err(|_| "meta write failed")?;
-    tls.flush().await.map_err(|_| "meta flush failed")?;
-    log::info!("Sent metadata ({} bytes)", meta_bytes.len());
-
-    // Read peer metadata
-    let mut meta_accum = Vec::new();
-    let mut tmp = [0u8; 512];
-    let peer_id;
-
-    loop {
-        let n = tls.read(&mut tmp).await.map_err(|_| "meta read failed")?;
-        if n == 0 {
-            return Err("connection closed during metadata");
-        }
-        meta_accum.extend_from_slice(&tmp[..n]);
-
-        match Metadata::decode(&meta_accum, password) {
-            Ok((peer_meta, consumed)) => {
-                if !peer_meta.check() {
-                    return Err("incompatible protocol version");
-                }
-                log::info!(
-                    "Peer key: {}...",
-                    hex_encode_short(&peer_meta.public_key)
-                );
-
-                let pid = node.add_peer(peer_meta.public_key, 0);
-                node.mark_handshake_done(pid);
-                peer_id = pid;
-                log::info!("Peer registered (id={})", pid);
-
-                // Handle leftover bytes
-                if meta_accum.len() > consumed {
-                    let leftover = meta_accum[consumed..].to_vec();
-                    let events = node.handle_peer_data(pid, &leftover, 0, &mut EspRng);
-                    for ev in &events {
-                        if let NodeEvent::SendToPeer { data, .. } = ev {
-                            tls.write_all(data).await.map_err(|_| "write failed")?;
+    // Helper macros for multi-peer dispatch
+    macro_rules! send_to_peers {
+        ($events:expr, $peers:expr) => {
+            for ev in $events {
+                if let NodeEvent::SendToPeer { peer_id, data } = ev {
+                    for (pid, tls) in $peers.iter_mut() {
+                        if *pid == *peer_id {
+                            let _ = tls.write_all(data).await;
+                            break;
                         }
                     }
-                    tls.flush().await.map_err(|_| "flush failed")?;
                 }
-                break;
             }
-            Err(yggdrasil_lite::meta::MetaError::TooShort)
-            | Err(yggdrasil_lite::meta::MetaError::BufferTooSmall) => {
+        };
+    }
+
+    // ── Connect to all configured peers ────────────────────────────────
+    let mut peers: Vec<(PeerId, PeerTls<'b>)> = Vec::new();
+
+    // Hand out one pre-allocated buffer set per peer from the reusable pool.
+    let mut buf_iter = peer_bufs.iter_mut();
+
+    for &(peer_ip, peer_port) in peer_addrs {
+        let bufs = match buf_iter.next() {
+            Some(b) => b,
+            None => break, // pool exhausted (more peers than slots)
+        };
+        log::info!("Connecting to peer {}:{}...", peer_ip, peer_port);
+
+        let mut socket = TcpSocket::new(sta_stack, &mut bufs.tcp_rx[..], &mut bufs.tcp_tx[..]);
+        socket.set_timeout(Some(Duration::from_secs(30)));
+
+        let endpoint = match peer_ip {
+            core::net::IpAddr::V4(v4) => (v4, peer_port),
+            core::net::IpAddr::V6(_) => {
+                log::warn!("Skipping IPv6 peer {}:{}", peer_ip, peer_port);
                 continue;
             }
-            Err(_e) => {
-                return Err("metadata decode error");
+        };
+
+        if let Err(e) = socket.connect(endpoint).await {
+            log::error!("TCP connect to {}:{} failed: {:?}", peer_ip, peer_port, e);
+            continue;
+        }
+        log::info!("TCP connected to {}:{}", peer_ip, peer_port);
+
+        // TLS handshake
+        let tls_config = TlsConfig::new().with_server_name("yggdrasil");
+        let mut tls: PeerTls<'b> =
+            TlsConnection::new(socket, &mut bufs.tls_rb[..], &mut bufs.tls_wb[..]);
+
+        if let Err(e) = tls.open(TlsContext::new(
+            &tls_config,
+            UnsecureProvider::new::<Aes256GcmSha384>(EspRng),
+        )).await {
+            log::error!("TLS handshake with {}:{} failed: {:?}", peer_ip, peer_port, e);
+            continue;
+        }
+        log::info!("TLS handshake complete with {}:{}", peer_ip, peer_port);
+
+        // Metadata exchange
+        let password: &[u8] = b"";
+        let our_meta = Metadata::new(*public_key, 0);
+        let meta_bytes = our_meta.encode(signing_key, password);
+
+        tls.write_all(&meta_bytes).await.map_err(|_| "meta write failed")?;
+        tls.flush().await.map_err(|_| "meta flush failed")?;
+        log::info!("Sent metadata ({} bytes)", meta_bytes.len());
+
+        // Read peer metadata
+        let mut meta_accum = Vec::new();
+        let mut tmp = [0u8; 512];
+        let mut peer_id: PeerId = 0;
+        let mut meta_ok = false;
+
+        loop {
+            let n = match tls.read(&mut tmp).await {
+                Ok(0) => { log::error!("Connection closed during metadata"); break; }
+                Ok(n) => n,
+                Err(_) => { log::error!("Meta read error from {}:{}", peer_ip, peer_port); break; }
+            };
+            meta_accum.extend_from_slice(&tmp[..n]);
+
+            match Metadata::decode(&meta_accum, password) {
+                Ok((peer_meta, consumed)) => {
+                    if !peer_meta.check() {
+                        log::error!("Incompatible protocol from {}:{}", peer_ip, peer_port);
+                        break;
+                    }
+                    log::info!("Peer key: {}...", hex_encode_short(&peer_meta.public_key));
+
+                    let pid = node.add_peer(peer_meta.public_key, 0);
+                    node.mark_handshake_done(pid);
+                    peer_id = pid;
+                    log::info!("Peer registered (id={})", pid);
+
+                    // Handle leftover bytes
+                    if meta_accum.len() > consumed {
+                        let leftover = meta_accum[consumed..].to_vec();
+                        let events = node.handle_peer_data(pid, &leftover, 0, &mut EspRng);
+                        for ev in &events {
+                            if let NodeEvent::SendToPeer { peer_id: target, data } = ev {
+                                if *target == pid {
+                                    let _ = tls.write_all(data).await;
+                                }
+                            }
+                        }
+                        let _ = tls.flush().await;
+                    }
+                    meta_ok = true;
+                    break;
+                }
+                Err(yggdrasil_lite::meta::MetaError::TooShort)
+                | Err(yggdrasil_lite::meta::MetaError::BufferTooSmall) => {
+                    continue;
+                }
+                Err(_e) => {
+                    log::error!("Metadata decode error from {}:{}", peer_ip, peer_port);
+                    break;
+                }
             }
         }
+
+        if meta_ok {
+            peers.push((peer_id, tls));
+        }
+    }
+
+    if peers.is_empty() {
+        return Err("No peers connected");
     }
 
     // ── Initial poll ───────────────────────────────────────────────────
     {
         let events = node.poll(0, &mut EspRng);
-        for ev in &events {
-            if let NodeEvent::SendToPeer { data, .. } = ev {
-                tls.write_all(data).await.map_err(|_| "write failed")?;
-            }
+        send_to_peers!(&events, peers);
+        for (_, tls) in peers.iter_mut() {
+            let _ = tls.flush().await;
         }
-        tls.flush().await.map_err(|_| "flush failed")?;
     }
 
     log::info!(
-        "Yggdrasil online! Telnet on [{}]:{}",
+        "Yggdrasil online with {} peer(s)! Telnet on [{}]:{}",
+        peers.len(),
         format_ipv6(our_addr),
         TELNET_PORT
     );
@@ -1239,27 +1289,46 @@ async fn connect_and_run_peer(
             let now_ms = start.elapsed().as_millis() as u64;
             let smol_now = SmolInstant::from_millis(now_ms as i64);
 
-            // ── 1. Read from TLS ───────────────────────────────────────
-            let tls_read = tls.read(&mut tls_buf);
-            let timeout = Timer::after(Duration::from_millis(50));
-
-            match select(tls_read, timeout).await {
-                Either::First(Ok(0)) => {
-                    log::info!("Peer disconnected (EOF)");
-                    return Ok(());
+            // ── 1. Read from all peers (two-phase) ────────────────────
+            {
+                // Phase 1: Read data from each peer
+                let mut incoming: Vec<(PeerId, Vec<u8>)> = Vec::new();
+                for (pid, tls) in peers.iter_mut() {
+                    let tls_read = tls.read(&mut tls_buf);
+                    let timeout = Timer::after(Duration::from_millis(10));
+                    match select(tls_read, timeout).await {
+                        Either::First(Ok(0)) => {
+                            log::info!("Peer {} disconnected (EOF)", pid);
+                            return Ok(());
+                        }
+                        Either::First(Ok(n)) => {
+                            incoming.push((*pid, tls_buf[..n].to_vec()));
+                        }
+                        Either::First(Err(_e)) => {
+                            log::error!("TLS read error on peer {}", pid);
+                            return Err("TLS read error");
+                        }
+                        Either::Second(_) => {}
+                    }
                 }
-                Either::First(Ok(n)) => {
-                    let events = node.handle_peer_data(peer_id, &tls_buf[..n], now_ms, &mut EspRng);
+
+                // Phase 2: Process incoming data (full access to peers for dispatch)
+                for (pid, data) in &incoming {
+                    let events = node.handle_peer_data(*pid, data, now_ms, &mut EspRng);
                     for event in &events {
                         match event {
-                            NodeEvent::SendToPeer { data, .. } => {
-                                let _ = tls.write_all(data).await;
+                            NodeEvent::SendToPeer { peer_id, data } => {
+                                for (p, tls) in peers.iter_mut() {
+                                    if *p == *peer_id {
+                                        let _ = tls.write_all(data).await;
+                                        break;
+                                    }
+                                }
                             }
                             NodeEvent::Deliver { source, data } => {
                                 if data.len() > 1 && data[0] == TYPE_SESSION_TRAFFIC {
                                     let ipv6_packet = &data[1..];
 
-                                    // Record source key → IPv6 mapping
                                     let source_addr = addr_for_key(source);
                                     let source_ipv6 = core::net::Ipv6Addr::from(source_addr.0);
                                     let mut found = false;
@@ -1275,19 +1344,12 @@ async fn connect_and_run_peer(
                                     }
 
                                     log::debug!("RECV {} bytes from {}", ipv6_packet.len(), source_ipv6);
-
-                                    // Feed to smoltcp — ICMPv6 is handled automatically
                                     device.push_rx(ipv6_packet.to_vec());
                                 }
                             }
                         }
                     }
                 }
-                Either::First(Err(_e)) => {
-                    log::error!("TLS read error");
-                    return Err("TLS read error");
-                }
-                Either::Second(_) => {}
             }
 
             // ── 2. smoltcp poll (processes rx, generates tx) ───────────
@@ -1301,11 +1363,7 @@ async fn connect_and_run_peer(
                     payload.extend_from_slice(&pkt);
 
                     let send_events = node.send(&dest_key, &payload, now_ms, &mut EspRng);
-                    for sev in &send_events {
-                        if let NodeEvent::SendToPeer { data, .. } = sev {
-                            let _ = tls.write_all(data).await;
-                        }
-                    }
+                    send_to_peers!(&send_events, peers);
                 }
             }
 
@@ -1614,11 +1672,7 @@ async fn connect_and_run_peer(
                     payload.extend_from_slice(&pkt);
 
                     let send_events = node.send(&dest_key, &payload, now_ms, &mut EspRng);
-                    for sev in &send_events {
-                        if let NodeEvent::SendToPeer { data, .. } = sev {
-                            let _ = tls.write_all(data).await;
-                        }
-                    }
+                    send_to_peers!(&send_events, peers);
                 }
             }
 
@@ -1627,17 +1681,13 @@ async fn connect_and_run_peer(
             if now_ms.saturating_sub(last_poll_ms) >= 100 {
                 last_poll_ms = now_ms;
                 let events = node.poll(now_ms, &mut EspRng);
-                if !events.is_empty() {
-                    for ev in &events {
-                        if let NodeEvent::SendToPeer { data, .. } = ev {
-                            let _ = tls.write_all(data).await;
-                        }
-                    }
-                }
+                send_to_peers!(&events, peers);
             }
 
-            // ── 8. Flush TLS ───────────────────────────────────────────
-            let _ = tls.flush().await;
+            // ── 8. Flush all TLS connections ──────────────────────────
+            for (_, tls) in peers.iter_mut() {
+                let _ = tls.flush().await;
+            }
 
             // ── 9. Status output ───────────────────────────────────────
             if now_ms.saturating_sub(last_status_ms) >= 30_000 {
