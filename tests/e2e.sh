@@ -13,6 +13,10 @@
 # Required:
 #   YGGSTACK_BIN  — path to the yggstack binary
 #
+# Optional:
+#   LITE_FEATURES — cargo features for lite_node (default: smoltcp;
+#                   use "smoltcp,transit" to test a transit build)
+#
 # Usage:
 #   YGGSTACK_BIN=/path/to/yggstack bash tests/e2e.sh
 #
@@ -20,6 +24,7 @@ set -uo pipefail
 
 # ── Configuration ─────────────────────────────────────────────────────
 : "${YGGSTACK_BIN:?Set YGGSTACK_BIN to the yggstack binary path}"
+LITE_FEATURES="${LITE_FEATURES:-smoltcp}"
 SOCKS_PORT=$((RANDOM % 10000 + 20000))
 TEST_TIMEOUT="${TEST_TIMEOUT:-60}"
 CURL_ATTEMPT_TIMEOUT="${CURL_ATTEMPT_TIMEOUT:-10}"
@@ -119,11 +124,11 @@ TLS_ADDR="${TLS_LINE#Listening on tls://}"
 info "yggstack TLS listener at $TLS_ADDR"
 
 # ── 3. Build and start lite_node ─────────────────────────────────────
-info "Building lite_node example"
-cargo build --example lite_node -F smoltcp --manifest-path "$CRATE_DIR/Cargo.toml" 2>&1 || fail "Failed to build lite_node"
+info "Building lite_node example (features: $LITE_FEATURES)"
+cargo build --example lite_node -F "$LITE_FEATURES" --manifest-path "$CRATE_DIR/Cargo.toml" 2>&1 || fail "Failed to build lite_node"
 
 info "Starting lite_node (peer: $TLS_ADDR, seed: ${LITE_SEED:0:8}...)"
-cargo run --example lite_node --manifest-path "$CRATE_DIR/Cargo.toml" -- "$TLS_ADDR" --seed "$LITE_SEED" \
+cargo run --example lite_node -F "$LITE_FEATURES" --manifest-path "$CRATE_DIR/Cargo.toml" -- "$TLS_ADDR" --seed "$LITE_SEED" \
     > "$WORKDIR/lite_node.log" 2>&1 &
 LITE_PID=$!
 

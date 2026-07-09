@@ -7,7 +7,9 @@
 //! - Generating its own announcement
 //! - Computing its tree coordinates (path from root to self)
 //!
-//! The leaf node never acts as transit — it only accepts traffic destined for itself.
+//! Without the `transit` feature the node never acts as transit — it only
+//! accepts traffic destined for itself. With `transit` enabled the same tree
+//! state also serves downstream peers that select us as their parent.
 
 use alloc::vec::Vec;
 use crate::crypto::{Crypto, PublicKey, Sig};
@@ -699,6 +701,12 @@ impl LeafTree {
     /// Returns our own key if we are self-rooted.
     pub fn get_parent(&self) -> Option<PublicKey> {
         self.get_info(&self.our_key).map(|info| info.parent)
+    }
+
+    /// The announced tree parent of an arbitrary node, if known.
+    /// Used by transit nodes to detect children (peers whose parent is us).
+    pub fn parent_of(&self, key: &PublicKey) -> Option<PublicKey> {
+        self.get_info(key).map(|info| info.parent)
     }
 
     /// Get ancestry: list of keys from root down to `key`.

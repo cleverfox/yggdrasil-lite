@@ -26,11 +26,18 @@ smoltcp = { version = "0.12", optional = true, default-features = false, feature
 default = ["std"]
 std = []
 smoltcp = ["dep:smoltcp"]
+# Act as a transit node: merge peer bloom filters into advertisements,
+# forward PathLookup/PathNotify/PathBroken, and forward traffic between peers.
+transit = []
 
 [dev-dependencies]
 rand = "0.8"
 hex = "0.4"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+
+[[test]]
+name = "transit"
+required-features = ["std", "transit"]
 
 [[example]]
 name = "lite_node"

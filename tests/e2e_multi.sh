@@ -74,8 +74,9 @@ extract_match() {
 KEYS_DIR="$SCRIPT_DIR/keys"
 LITE_SEED_FILE="$KEYS_DIR/lite_node.seed"
 YGGSTACK_KEY_FILE="$KEYS_DIR/yggstack.key"
+YGGSTACK2_KEY_FILE="$KEYS_DIR/yggstack2.key"
 
-if [[ ! -f "$LITE_SEED_FILE" ]] || [[ ! -f "$YGGSTACK_KEY_FILE" ]]; then
+if [[ ! -f "$LITE_SEED_FILE" ]] || [[ ! -f "$YGGSTACK_KEY_FILE" ]] || [[ ! -f "$YGGSTACK2_KEY_FILE" ]]; then
     info "Test keys not found, generating..."
     cargo run --example gen_test_keys --manifest-path "$CRATE_DIR/Cargo.toml" 2>&1 \
         || fail "Failed to generate test keys"
@@ -83,8 +84,10 @@ fi
 
 LITE_SEED="$(cat "$LITE_SEED_FILE")"
 YGGSTACK_KEY="$(cat "$YGGSTACK_KEY_FILE")"
+YGGSTACK2_KEY="$(cat "$YGGSTACK2_KEY_FILE")"
 [[ -n "$LITE_SEED" ]] || fail "Empty lite_node seed"
 [[ -n "$YGGSTACK_KEY" ]] || fail "Empty yggstack key"
+[[ -n "$YGGSTACK2_KEY" ]] || fail "Empty yggstack2 key"
 info "Using stored test keys"
 
 # ── 1. Generate yggstack1 config (with stored key, TLS listener only) ─────
@@ -111,10 +114,11 @@ TLS_ADDR1="${TLS_LINE#Listening on tls://}"
 [[ -z "$TLS_ADDR1" ]] && fail "Could not parse yggstack1 TLS address"
 info "yggstack1 TLS at $TLS_ADDR1"
 
-# ── 3. Generate yggstack2 config (fresh key, TLS only, NO peering with yggstack1) ──
+# ── 3. Generate yggstack2 config (stored key, TLS only, NO peering with yggstack1) ──
 info "Generating yggstack2 config (isolated — no peering with yggstack1)"
 "$YGGSTACK_BIN" --genconf 2>/dev/null \
     | sed 's|"tcp://0.0.0.0:0"|"tls://127.0.0.1:0"|' \
+    | sed "s|\"PrivateKey\": \"[a-fA-F0-9]*\"|\"PrivateKey\": \"${YGGSTACK2_KEY}\"|" \
     > "$WORKDIR/yggstack2.conf"
 [[ -s "$WORKDIR/yggstack2.conf" ]] || fail "Failed to generate yggstack2 config"
 
@@ -134,12 +138,16 @@ TLS_ADDR2="${TLS_LINE2#Listening on tls://}"
 info "yggstack2 TLS at $TLS_ADDR2"
 
 # ── 5. Build and start lite_node (multi-peer: connects to BOTH) ───────
-info "Building lite_node"
-cargo build --example lite_node --manifest-path "$CRATE_DIR/Cargo.toml" 2>&1 \
+LITE_FEATURES="${LITE_FEATURES:-}"
+FEATURE_ARGS=()
+[[ -n "$LITE_FEATURES" ]] && FEATURE_ARGS=(-F "$LITE_FEATURES")
+
+info "Building lite_node${LITE_FEATURES:+ (features: $LITE_FEATURES)}"
+cargo build --example lite_node "${FEATURE_ARGS[@]}" --manifest-path "$CRATE_DIR/Cargo.toml" 2>&1 \
     || fail "Failed to build lite_node"
 
 info "Starting lite_node (peers: $TLS_ADDR1, $TLS_ADDR2)"
-cargo run --example lite_node --manifest-path "$CRATE_DIR/Cargo.toml" -- \
+cargo run --example lite_node "${FEATURE_ARGS[@]}" --manifest-path "$CRATE_DIR/Cargo.toml" -- \
     "$TLS_ADDR1" "$TLS_ADDR2" --seed "$LITE_SEED" \
     > "$WORKDIR/lite_node.log" 2>&1 &
 LITE_PID=$!

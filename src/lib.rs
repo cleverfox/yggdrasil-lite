@@ -1,8 +1,16 @@
-//! yggdrasil-lite: Minimal leaf-only Yggdrasil client for embedded devices.
+//! yggdrasil-lite: Minimal Yggdrasil node for embedded devices.
 //!
 //! This crate implements a subset of the Yggdrasil/Ironwood protocol sufficient
 //! to operate as a leaf node: connecting to 2-3 peers, participating in the
 //! spanning tree, and exchanging encrypted packets with any node in the network.
+//!
+//! With the `transit` feature the node additionally acts as a router: it
+//! merges peer bloom filters into its advertisements, forwards path
+//! discovery messages, and forwards traffic between peers. Individual peers
+//! can be excluded from redistribution with
+//! [`YggdrasilLite::set_peer_no_redistribute`] — marking every peer turns a
+//! transit build into a pure stub (multi-homed, but never carrying third-party
+//! traffic).
 //!
 //! Designed for `no_std` + `alloc` environments (ESP32-C6 with Embassy).
 //!

@@ -93,11 +93,14 @@ const PATH_TIMEOUT_MS: u64 = 60_000;
 /// Minimum interval between path lookups to the same destination.
 const PATH_THROTTLE_MS: u64 = 5_000;
 
+/// Maximum payloads parked while waiting for path discovery.
+const MAX_PENDING_TRAFFIC: usize = 4;
+
 // ---------------------------------------------------------------------------
 // YggdrasilLite
 // ---------------------------------------------------------------------------
 
-/// Minimal leaf-only Yggdrasil node.
+/// Minimal Yggdrasil node (leaf by default, router with the `transit` feature).
 ///
 /// Coordinates tree participation, bloom filters, path discovery,
 /// and encrypted sessions. Transport-agnostic: the caller handles
@@ -112,6 +115,10 @@ pub struct YggdrasilLite {
     blooms: LeafBlooms,
     pathfinder: LeafPathfinder,
     sessions: SessionManager,
+
+    /// Encrypted payloads waiting for path discovery (dest → session data).
+    /// Flushed when the matching PathNotify arrives; bounded.
+    pending_traffic: Vec<(PublicKey, Vec<u8>)>,
 
     // Timers (tick-based, ms)
     last_tree_tick: u64,
@@ -139,6 +146,7 @@ impl YggdrasilLite {
             tree: LeafTree::new(crypto.public_key),
             sessions: SessionManager::new(),
             peers: PeerManager::new(),
+            pending_traffic: Vec::new(),
             crypto,
             curve_priv,
             password: config.password,
@@ -296,7 +304,7 @@ impl YggdrasilLite {
                 self.handle_path_lookup(peer_id, peer_key, payload, now_ms)
             }
             PacketType::ProtoPathNotify => self.handle_path_notify(payload, now_ms),
-            PacketType::ProtoPathBroken => self.handle_path_broken(payload),
+            PacketType::ProtoPathBroken => self.handle_path_broken(payload, now_ms),
             PacketType::Traffic => self.handle_traffic(payload, now_ms, rng),
         }
     }
@@ -355,13 +363,11 @@ impl YggdrasilLite {
         };
 
         let actions = self.tree.handle_announce(peer_id, &peer_key, &ann);
-        let events = self.tree_actions_to_events(actions);
+        let mut events = self.tree_actions_to_events(actions);
 
-        // After tree update, refresh our own path info and bloom parent
+        // After tree update, refresh our own path info and bloom tree state
         self.update_own_path_info(now_ms);
-        if let Some(parent) = self.tree.get_parent() {
-            self.blooms.set_parent(&parent, &self.crypto.public_key);
-        }
+        events.extend(self.sync_bloom_tree_state());
 
         events
     }
@@ -384,6 +390,14 @@ impl YggdrasilLite {
             Ok(l) => l,
             Err(_) => return Vec::new(),
         };
+        let _ = peer_id; // only used for the direct reply in leaf builds
+
+        // Transit: the lookup multicast flows strictly along tree edges, so
+        // drop lookups arriving over off-tree links (matches ironwood).
+        #[cfg(feature = "transit")]
+        if !self.blooms.is_on_tree(&from_key) {
+            return Vec::new();
+        }
 
         let mut events = Vec::new();
 
@@ -392,34 +406,16 @@ impl YggdrasilLite {
         // using the bloom transform rather than direct key equality.
         let dest_xkey = bloom_transform(lookup.dest);
         let our_xkey = bloom_transform(self.crypto.public_key);
-        if dest_xkey == our_xkey {
-            // Respond with our path info via PathNotify.
-            // path = requester's coordinates (for greedy tree routing back to them)
-            // info.path = our coordinates (the actual path info for the pathfinder cache)
-            let our_coords = self.tree.get_coords();
-            let notify = wire::PathNotify {
-                path: lookup.from.clone(),
-                watermark: u64::MAX,
-                source: self.crypto.public_key,
-                dest: lookup.source,
-                info: wire::PathNotifyInfo {
-                    seq: self.pathfinder.info.seq,
-                    path: our_coords,
-                    sig: self.pathfinder.info.sig,
-                },
-            };
-            let mut notify_payload = Vec::new();
-            notify.encode(&mut notify_payload);
-            let frame = wire::encode_frame(PacketType::ProtoPathNotify, &notify_payload);
-            events.push(NodeEvent::SendToPeer {
-                peer_id,
-                data: frame,
-            });
-        } else {
-            // Forward lookup to other peers whose blooms match
+        let for_us = dest_xkey == our_xkey;
+
+        // Forward the lookup to other peers whose blooms match. Targets marked
+        // no-redistribute are excluded: we never offer transit toward them.
+        // (In transit mode this runs even when the lookup also matches us,
+        // like ironwood; in leaf mode only when it doesn't.)
+        if cfg!(feature = "transit") || !for_us {
             let targets = self
                 .blooms
-                .get_multicast_targets(&from_key, &lookup.dest);
+                .get_multicast_targets(&from_key, &lookup.dest, true);
             for target_key in targets {
                 if let Some(target_peer) = self.peers.get_by_key(&target_key) {
                     let target_id = target_peer.id;
@@ -435,6 +431,41 @@ impl YggdrasilLite {
             }
         }
 
+        if for_us {
+            // Respond with our path info via PathNotify.
+            // path = requester's coordinates (for greedy tree routing back to them)
+            // info.path = our coordinates (the actual path info for the pathfinder cache)
+            let our_coords = self.tree.get_coords();
+            let notify = wire::PathNotify {
+                path: lookup.from.clone(),
+                watermark: u64::MAX,
+                source: self.crypto.public_key,
+                dest: lookup.source,
+                info: wire::PathNotifyInfo {
+                    seq: self.pathfinder.info.seq,
+                    path: our_coords,
+                    sig: self.pathfinder.info.sig,
+                },
+            };
+            #[cfg(feature = "transit")]
+            {
+                // Route the notify greedily toward the requester's coords.
+                events.extend(self.process_path_notify(notify, _now_ms));
+            }
+            #[cfg(not(feature = "transit"))]
+            {
+                // Leaf: reply directly to the peer the lookup came from.
+                let mut notify_payload = Vec::new();
+                notify.encode(&mut notify_payload);
+                let frame =
+                    wire::encode_frame(PacketType::ProtoPathNotify, &notify_payload);
+                events.push(NodeEvent::SendToPeer {
+                    peer_id,
+                    data: frame,
+                });
+            }
+        }
+
         events
     }
 
@@ -447,6 +478,36 @@ impl YggdrasilLite {
             Ok(n) => n,
             Err(_) => return Vec::new(),
         };
+        self.process_path_notify(notify, now_ms)
+    }
+
+    /// Route a PathNotify greedily toward the requester's coordinates
+    /// (transit), or accept it locally if it is addressed to us.
+    fn process_path_notify(&mut self, notify: wire::PathNotify, now_ms: u64) -> Vec<NodeEvent> {
+        #[cfg(feature = "transit")]
+        {
+            let mut watermark = notify.watermark;
+            if let Some(peer_id) = self.lookup_next_hop(&notify.path, &mut watermark) {
+                let mut fwd = notify.clone();
+                fwd.watermark = watermark;
+                let mut fwd_payload = Vec::new();
+                fwd.encode(&mut fwd_payload);
+                let frame = wire::encode_frame(PacketType::ProtoPathNotify, &fwd_payload);
+                return alloc::vec![NodeEvent::SendToPeer { peer_id, data: frame }];
+            }
+        }
+
+        if notify.dest != self.crypto.public_key {
+            return Vec::new();
+        }
+
+        // Verify the signed path info before accepting it.
+        let mut info_bytes = Vec::new();
+        wire::encode_uvarint(&mut info_bytes, notify.info.seq);
+        wire::encode_path(&mut info_bytes, &notify.info.path);
+        if !Crypto::verify(&notify.source, &info_bytes, &notify.info.sig) {
+            return Vec::new();
+        }
 
         // Accept the notify into our pathfinder.
         // source = the key that originally replied (full key).
@@ -460,15 +521,56 @@ impl YggdrasilLite {
             now_ms,
         );
 
-        Vec::new()
+        // Flush any traffic parked while this destination's path was unknown.
+        let mut events = Vec::new();
+        if self.pathfinder.get_path(&notify.source).is_some() {
+            let mut kept = Vec::new();
+            let mut flushed = Vec::new();
+            for (dest, payload) in core::mem::take(&mut self.pending_traffic) {
+                if dest == notify.source {
+                    flushed.push((dest, payload));
+                } else {
+                    kept.push((dest, payload));
+                }
+            }
+            self.pending_traffic = kept;
+            for (dest, payload) in flushed {
+                if let Some(event) = self.route_to_dest(&dest, payload) {
+                    events.push(event);
+                }
+            }
+        }
+
+        events
     }
 
-    fn handle_path_broken(&mut self, payload: &[u8]) -> Vec<NodeEvent> {
+    fn handle_path_broken(&mut self, payload: &[u8], now_ms: u64) -> Vec<NodeEvent> {
         let broken = match wire::PathBroken::decode(payload) {
             Ok(b) => b,
             Err(_) => return Vec::new(),
         };
-        self.pathfinder.handle_broken(&broken.source);
+        self.process_path_broken(broken, now_ms)
+    }
+
+    /// Route a PathBroken toward the traffic source, or consume it if it is
+    /// about our own traffic: mark the path broken and re-initiate discovery.
+    fn process_path_broken(&mut self, broken: wire::PathBroken, now_ms: u64) -> Vec<NodeEvent> {
+        #[cfg(feature = "transit")]
+        {
+            let mut watermark = broken.watermark;
+            if let Some(peer_id) = self.lookup_next_hop(&broken.path, &mut watermark) {
+                let mut fwd = broken.clone();
+                fwd.watermark = watermark;
+                let mut fwd_payload = Vec::new();
+                fwd.encode(&mut fwd_payload);
+                let frame = wire::encode_frame(PacketType::ProtoPathBroken, &fwd_payload);
+                return alloc::vec![NodeEvent::SendToPeer { peer_id, data: frame }];
+            }
+        }
+        if broken.source == self.crypto.public_key {
+            self.pathfinder.handle_broken(&broken.dest);
+            return self.initiate_path_lookup(&broken.dest, now_ms);
+        }
         Vec::new()
     }
 
@@ -484,20 +586,40 @@ impl YggdrasilLite {
             Err(_) => return Vec::new(),
         };
 
-        // Only accept traffic destined for us
         if traffic.dest != self.crypto.public_key {
+            // Transit: forward traffic toward its path, or report the path
+            // as broken back to the source if we have no closer next hop.
+            #[cfg(feature = "transit")]
+            {
+                let mut watermark = traffic.watermark;
+                if let Some(peer_id) = self.lookup_next_hop(&traffic.path, &mut watermark) {
+                    let mut fwd = traffic;
+                    fwd.watermark = watermark;
+                    let mut fwd_payload = Vec::new();
+                    fwd.encode(&mut fwd_payload);
+                    let frame = wire::encode_frame(PacketType::Traffic, &fwd_payload);
+                    return alloc::vec![NodeEvent::SendToPeer { peer_id, data: frame }];
+                }
+                let broken = wire::PathBroken {
+                    path: traffic.from.clone(),
+                    watermark: u64::MAX,
+                    source: traffic.source,
+                    dest: traffic.dest,
+                };
+                return self.process_path_broken(broken, now_ms);
+            }
+            #[cfg(not(feature = "transit"))]
             return Vec::new();
         }
 
-        // Cache the sender's coordinates from the traffic.from field
-        // so we can route responses back without needing a separate PathNotify
-        if !traffic.from.is_empty() {
-            self.pathfinder.update_path(
-                traffic.source,
-                traffic.from.clone(),
-                now_ms,
-            );
-        }
+        // Cache the sender's coordinates from the traffic.from field so we
+        // can route responses back without needing a separate PathNotify.
+        // An empty path is valid: it means the sender is the tree root.
+        self.pathfinder.update_path(
+            traffic.source,
+            traffic.from.clone(),
+            now_ms,
+        );
 
         // Session-level handling
         let session_actions = self.sessions.handle_data(
@@ -618,10 +740,11 @@ impl YggdrasilLite {
         lookup.encode(&mut payload);
         let frame = wire::encode_frame(PacketType::ProtoPathLookup, &payload);
 
-        // Multicast to peers whose bloom filters match
+        // Multicast to peers whose bloom filters match. This is our own
+        // lookup, so no-redistribute peers are legitimate targets.
         let targets = self
             .blooms
-            .get_multicast_targets(&self.crypto.public_key, dest);
+            .get_multicast_targets(&self.crypto.public_key, dest, false);
 
         let mut events = Vec::new();
         for target_key in &targets {
@@ -692,11 +815,9 @@ impl YggdrasilLite {
                 self.last_tree_refresh_tick = now_ms;
             }
 
-            // Update own path info and bloom parent after tree changes
+            // Update own path info and bloom tree state after tree changes
             self.update_own_path_info(now_ms);
-            if let Some(parent) = self.tree.get_parent() {
-                self.blooms.set_parent(&parent, &self.crypto.public_key);
-            }
+            events.extend(self.sync_bloom_tree_state());
         }
 
         // Bloom maintenance
@@ -723,6 +844,8 @@ impl YggdrasilLite {
         if now_ms.saturating_sub(self.last_path_cleanup_tick) >= PATH_CLEANUP_INTERVAL_MS {
             self.last_path_cleanup_tick = now_ms;
             self.pathfinder.cleanup_expired(now_ms, PATH_TIMEOUT_MS);
+            // Parked payloads whose lookup never resolved are stale by now.
+            self.pending_traffic.clear();
         }
 
         // Session cleanup
@@ -766,6 +889,64 @@ impl YggdrasilLite {
         self.pathfinder.update_own_info(now_ms, coords, &self.crypto);
     }
 
+    /// Synchronize the blooms' view of the tree after a tree change.
+    ///
+    /// Leaf builds mark only the parent link on-tree. Transit builds mark the
+    /// parent and all children (peers whose announced parent is us); peers
+    /// that just dropped off the tree get a blank bloom so they stop routing
+    /// lookups toward us.
+    fn sync_bloom_tree_state(&mut self) -> Vec<NodeEvent> {
+        let our_key = self.crypto.public_key;
+        let parent = match self.tree.get_parent() {
+            Some(p) => p,
+            None => return Vec::new(),
+        };
+
+        #[cfg(feature = "transit")]
+        {
+            let children: Vec<PublicKey> = self
+                .peers
+                .iter()
+                .filter(|p| self.tree.parent_of(&p.key) == Some(our_key))
+                .map(|p| p.key)
+                .collect();
+            let blanks = self.blooms.update_on_tree(&our_key, &parent, &children);
+            let mut events = Vec::new();
+            for (peer_key, filter) in &blanks {
+                if let Some(peer) = self.peers.get_by_key(peer_key) {
+                    let peer_id = peer.id;
+                    let mut payload = Vec::new();
+                    filter.encode(&mut payload);
+                    let frame = wire::encode_frame(PacketType::ProtoBloomFilter, &payload);
+                    events.push(NodeEvent::SendToPeer { peer_id, data: frame });
+                }
+            }
+            events
+        }
+        #[cfg(not(feature = "transit"))]
+        {
+            self.blooms.set_parent(&parent, &our_key);
+            Vec::new()
+        }
+    }
+
+    /// Mark a peer as no-redistribute: its keys (recv bloom) are never merged
+    /// into blooms advertised to other peers, and lookups from other peers are
+    /// never forwarded toward it. Our own lookups still use it. Marking every
+    /// peer on a transit build makes the node a pure stub (no transit at all).
+    ///
+    /// Only meaningful with the `transit` feature; leaf builds never
+    /// redistribute anything. Returns `false` if the peer is unknown.
+    pub fn set_peer_no_redistribute(&mut self, peer_id: PeerId, flag: bool) -> bool {
+        if let Some(peer) = self.peers.get(peer_id) {
+            let key = peer.key;
+            self.blooms.set_no_redistribute(&key, flag);
+            true
+        } else {
+            false
+        }
+    }
+
     /// Convert a single tree action to a node event.
     fn tree_action_to_event(&self, action: TreeAction) -> Option<NodeEvent> {
         match action {
@@ -801,7 +982,7 @@ impl YggdrasilLite {
     /// Convert session actions to node events. Routes encrypted data through
     /// the tree using Traffic frames.
     fn session_actions_to_events(
-        &self,
+        &mut self,
         _dest: &PublicKey,
         actions: Vec<SessionAction>,
     ) -> Vec<NodeEvent> {
@@ -825,53 +1006,52 @@ impl YggdrasilLite {
     /// Route an encrypted payload to a destination via tree coordinates.
     ///
     /// Wraps in a Traffic frame and sends to the appropriate next-hop peer.
-    fn route_to_dest(&self, dest: &PublicKey, payload: Vec<u8>) -> Option<NodeEvent> {
+    /// With no known path the payload is parked in `pending_traffic` and
+    /// flushed when the PathNotify for the destination arrives (a lookup is
+    /// initiated by the callers). Blind-sending with an empty path would
+    /// route the packet toward the tree root, bypassing bloom-gated
+    /// discovery — and with it the no_redistribute policy of transit nodes.
+    fn route_to_dest(&mut self, dest: &PublicKey, payload: Vec<u8>) -> Option<NodeEvent> {
         // Get destination coordinates from pathfinder
         let dest_path = match self.pathfinder.get_path(dest) {
             Some(p) => p.to_vec(),
             None => {
-                // No path yet — send to the first connected peer as a fallback
-                // (the session init will have been sent already)
-                for peer in self.peers.iter() {
-                    if peer.handshake_done {
-                        let traffic = wire::Traffic {
-                            path: Vec::new(),
-                            from: self.tree.get_coords(),
-                            source: self.crypto.public_key,
-                            dest: *dest,
-                            watermark: u64::MAX,
-                            payload,
-                        };
-                        let mut traffic_payload = Vec::new();
-                        traffic.encode(&mut traffic_payload);
-                        let frame =
-                            wire::encode_frame(PacketType::Traffic, &traffic_payload);
-                        return Some(NodeEvent::SendToPeer {
-                            peer_id: peer.id,
-                            data: frame,
-                        });
-                    }
+                // Keep only the newest payload per destination (pre-session
+                // this is the handshake init, which is safe to replace).
+                self.pending_traffic.retain(|(k, _)| k != dest);
+                if self.pending_traffic.len() >= MAX_PENDING_TRAFFIC {
+                    self.pending_traffic.remove(0);
                 }
+                self.pending_traffic.push((*dest, payload));
                 return None;
+            }
+        };
+
+        // Find next hop by greedy tree routing, recording our distance in the
+        // watermark so downstream transit nodes enforce monotonic progress.
+        let mut watermark = u64::MAX;
+        let next_hop = match self.lookup_next_hop(&dest_path, &mut watermark) {
+            Some(id) => id,
+            None => {
+                // No peer is closer — send to the first connected peer as a
+                // fallback (leaf pragmatism: our parent usually knows better).
+                watermark = u64::MAX;
+                self.peers.iter().find(|p| p.handshake_done).map(|p| p.id)?
             }
         };
 
         // Build Traffic message
         let traffic = wire::Traffic {
-            path: dest_path.clone(),
+            path: dest_path,
             from: self.tree.get_coords(),
             source: self.crypto.public_key,
             dest: *dest,
-            watermark: u64::MAX,
+            watermark,
             payload,
         };
         let mut traffic_payload = Vec::new();
         traffic.encode(&mut traffic_payload);
         let frame = wire::encode_frame(PacketType::Traffic, &traffic_payload);
-
-        // Find next hop by greedy tree routing
-        let our_coords = self.tree.get_coords();
-        let next_hop = self.find_next_hop(&dest_path, &our_coords)?;
 
         Some(NodeEvent::SendToPeer {
             peer_id: next_hop,
@@ -879,37 +1059,42 @@ impl YggdrasilLite {
         })
     }
 
-    /// Greedy tree routing: find the peer closest to the destination coordinates.
-    fn find_next_hop(&self, dest_path: &[PeerPort], our_coords: &[PeerPort]) -> Option<PeerId> {
+    /// Greedy tree routing with watermark (loop prevention across nodes).
+    ///
+    /// Returns the peer strictly closer to `path` (in tree space) than we are,
+    /// provided our own distance improves on the packet's watermark. On
+    /// success the watermark is updated to our distance. Mirrors ironwood's
+    /// `router.lookup`.
+    fn lookup_next_hop(&self, path: &[PeerPort], watermark: &mut u64) -> Option<PeerId> {
         use crate::tree::tree_dist;
 
-        let our_dist = tree_dist(our_coords, dest_path);
+        let our_coords = self.tree.get_coords();
+        let self_dist = tree_dist(&our_coords, path);
+        if self_dist >= *watermark {
+            return None;
+        }
+        *watermark = self_dist;
 
-        let mut best_peer: Option<PeerId> = None;
-        let mut best_dist = our_dist;
-
+        let mut best: Option<(PeerId, u64, u64)> = None; // (id, dist, order)
         for peer in self.peers.iter() {
-            if !peer.handshake_done {
+            if !peer.handshake_done || !self.tree.has_info(&peer.key) {
                 continue;
             }
             let (_, peer_coords) = self.tree.get_root_and_path(&peer.key);
-            let d = tree_dist(&peer_coords, dest_path);
-            if d < best_dist {
-                best_dist = d;
-                best_peer = Some(peer.id);
+            let d = tree_dist(&peer_coords, path);
+            if d >= self_dist {
+                continue;
+            }
+            let better = match best {
+                None => true,
+                Some((_, bd, bo)) => d < bd || (d == bd && peer.order < bo),
+            };
+            if better {
+                best = Some((peer.id, d, peer.order));
             }
         }
 
-        // If no peer is closer, send to the first connected peer as a fallback
-        if best_peer.is_none() {
-            for peer in self.peers.iter() {
-                if peer.handshake_done {
-                    return Some(peer.id);
-                }
-            }
-        }
-
-        best_peer
+        best.map(|(id, _, _)| id)
     }
 
     /// Get a reference to the pathfinder (for advanced queries).

@@ -1,8 +1,10 @@
 # yggdrasil-lite
 
-Minimal leaf-only [Yggdrasil](https://yggdrasil-network.github.io/) client for embedded devices.
+Minimal [Yggdrasil](https://yggdrasil-network.github.io/) client for embedded devices.
 
-Implements the Yggdrasil/Ironwood protocol subset needed to operate as a **leaf node**: connect to peers, join the spanning tree, discover paths via bloom filters, and exchange end-to-end encrypted packets with any node in the network. No transit routing, no TUN interface, no admin API.
+Implements the Yggdrasil/Ironwood protocol subset needed to operate as a **leaf node**: connect to peers, join the spanning tree, discover paths via bloom filters, and exchange end-to-end encrypted packets with any node in the network. No TUN interface, no admin API.
+
+By default there is no transit routing. The optional `transit` Cargo feature turns the node into a router: it merges peer bloom filters into its advertisements, forwards path discovery, and forwards traffic between peers. Individual peers can be excluded with `set_peer_no_redistribute(peer_id, true)` — their keys are never redistributed to other peers (no bloom merge, no lookup forwarding toward them), while the marked peer can still use the node as an uplink. Marking **all** peers makes a multi-homed stub that never carries third-party traffic.
 
 Designed for `no_std` + `alloc` environments (ESP32 with Embassy), but also builds with `std` for desktop testing.
 
@@ -11,6 +13,7 @@ Designed for `no_std` + `alloc` environments (ESP32 with Embassy), but also buil
 - Spanning tree participation (announce, SigReq/SigRes, parent selection)
 - Bloom filter routing (advertise own key, respond to PathLookup)
 - Path discovery (PathLookup / PathNotify / PathBroken)
+- Optional transit routing (`transit` feature) with per-peer `no_redistribute` policy
 - End-to-end encrypted sessions (XSalsa20-Poly1305 with key ratcheting)
 - Metadata handshake compatible with yggdrasil-go and yggdrasil-ng
 - IPv6 address derivation from Ed25519 public key (`200::/7`)

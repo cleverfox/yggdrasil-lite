@@ -118,6 +118,11 @@ pub struct PeerBloomInfo {
     pub seq: u16,
     /// Whether this peer is on the spanning tree (parent or child).
     pub on_tree: bool,
+    /// Do not redistribute this peer's keys to other peers: its `recv` bloom
+    /// is never merged into blooms advertised to others, and lookups from
+    /// other peers are never forwarded toward it. Our own lookups still use
+    /// it, so marking every peer turns a transit build into a stub node.
+    pub no_redistribute: bool,
 }
 
 impl PeerBloomInfo {
@@ -127,6 +132,7 @@ impl PeerBloomInfo {
             recv: BloomFilter::new(),
             seq: 0,
             on_tree: false,
+            no_redistribute: false,
         }
     }
 }
@@ -194,14 +200,64 @@ impl LeafBlooms {
         }
     }
 
+    /// Update on-tree status from exact tree relationships (transit mode).
+    ///
+    /// `parent_key`: our current parent (our own key if we are root).
+    /// `children`: peers whose announced tree parent is us.
+    ///
+    /// Returns `(peer_key, blank_filter)` pairs for peers that just dropped
+    /// off the tree — the blank filter must be sent to them so they don't
+    /// keep routing lookups toward us based on a stale advertisement.
+    #[cfg(feature = "transit")]
+    pub fn update_on_tree(
+        &mut self,
+        our_key: &PublicKey,
+        parent_key: &PublicKey,
+        children: &[PublicKey],
+    ) -> Vec<(PublicKey, BloomFilter)> {
+        let mut to_send = Vec::new();
+        for (k, info) in &mut self.peers {
+            let was_on = info.on_tree;
+            info.on_tree = (k == parent_key && parent_key != our_key) || children.contains(k);
+            if was_on && !info.on_tree {
+                let blank = BloomFilter::new();
+                info.send = blank.clone();
+                to_send.push((*k, blank));
+            }
+        }
+        to_send
+    }
+
+    /// Mark a peer as no-redistribute (see [`PeerBloomInfo::no_redistribute`]).
+    pub fn set_no_redistribute(&mut self, key: &PublicKey, flag: bool) {
+        if let Some(info) = self.find_mut(key) {
+            info.no_redistribute = flag;
+        }
+    }
+
+    /// Whether a peer link is currently on the spanning tree.
+    pub fn is_on_tree(&self, key: &PublicKey) -> bool {
+        self.find(key)
+            .map_or(false, |idx| self.peers[idx].1.on_tree)
+    }
+
     /// Compute the bloom filter to send to a given peer.
-    /// For a leaf node: just our own key (we have no children to merge).
-    pub fn compute_send_bloom(&self, _target_key: &PublicKey, our_key: &PublicKey) -> BloomFilter {
+    ///
+    /// Leaf builds advertise only our own key. Transit builds additionally
+    /// merge the recv blooms of all on-tree peers except the target, skipping
+    /// peers marked no-redistribute.
+    pub fn compute_send_bloom(&self, target_key: &PublicKey, our_key: &PublicKey) -> BloomFilter {
+        let _ = target_key;
         let mut b = BloomFilter::new();
         let xformed = self.x_key(our_key);
         b.add(&xformed);
-        // A leaf has no on-tree children, so no peer recv blooms to merge
-        // (our parent's recv bloom would be for the opposite direction)
+        #[cfg(feature = "transit")]
+        for (k, info) in &self.peers {
+            if k == target_key || !info.on_tree || info.no_redistribute {
+                continue;
+            }
+            b.merge(&info.recv);
+        }
         b
     }
 
@@ -228,11 +284,23 @@ impl LeafBlooms {
     }
 
     /// Find peers whose bloom filter matches a destination key.
-    pub fn get_multicast_targets(&self, from_key: &PublicKey, dest_key: &PublicKey) -> Vec<PublicKey> {
+    ///
+    /// `skip_no_redistribute` must be true when forwarding a lookup received
+    /// from a peer: no-redistribute peers are excluded as targets, so we never
+    /// offer transit toward them. It must be false for our own lookups.
+    pub fn get_multicast_targets(
+        &self,
+        from_key: &PublicKey,
+        dest_key: &PublicKey,
+        skip_no_redistribute: bool,
+    ) -> Vec<PublicKey> {
         let xformed = self.x_key(dest_key);
         let mut targets = Vec::new();
         for (k, info) in &self.peers {
             if !info.on_tree || k == from_key {
+                continue;
+            }
+            if skip_no_redistribute && info.no_redistribute {
                 continue;
             }
             if info.recv.test(&xformed) {
@@ -402,6 +470,61 @@ mod tests {
         let expected = hex::decode("fdbfffbfff7ffe7ffffffffcffffffff0000000000000000000000000000000020000000000000000000000000080000200000000000000000000000000080000000200000000000020000000000000000020000000000000200000000000000").unwrap();
         let expected_filter = BloomFilter::decode(&expected).unwrap();
         assert_eq!(filter, expected_filter);
+    }
+
+    #[cfg(feature = "transit")]
+    #[test]
+    fn transit_send_bloom_merges_on_tree_except_target_and_marked() {
+        let our_key = [0u8; 32];
+        let peer_a = [1u8; 32];
+        let peer_b = [2u8; 32];
+        let peer_c = [3u8; 32];
+        let key_in_a = [0xAAu8; 32];
+        let key_in_b = [0xBBu8; 32];
+        let key_in_c = [0xCCu8; 32];
+
+        let mut blooms = LeafBlooms::new(None);
+        for k in [peer_a, peer_b, peer_c] {
+            blooms.add_peer(k);
+        }
+
+        let mut recv = BloomFilter::new();
+        recv.add(&key_in_a);
+        blooms.handle_bloom(&peer_a, recv);
+        let mut recv = BloomFilter::new();
+        recv.add(&key_in_b);
+        blooms.handle_bloom(&peer_b, recv);
+        let mut recv = BloomFilter::new();
+        recv.add(&key_in_c);
+        blooms.handle_bloom(&peer_c, recv);
+
+        // a = parent, b = child, c = off-tree
+        blooms.update_on_tree(&our_key, &peer_a, &[peer_b]);
+        blooms.set_no_redistribute(&peer_b, true);
+
+        // Bloom for c: own key + a's recv; b excluded (no_redistribute).
+        let bloom = blooms.compute_send_bloom(&peer_c, &our_key);
+        assert!(bloom.test(&our_key));
+        assert!(bloom.test(&key_in_a));
+        assert!(!bloom.test(&key_in_b), "no_redistribute peer keys leaked");
+        assert!(!bloom.test(&key_in_c), "off-tree peer keys leaked");
+
+        // Bloom for a (the parent): b marked, c off-tree → only own key.
+        let bloom = blooms.compute_send_bloom(&peer_a, &our_key);
+        assert!(bloom.test(&our_key));
+        assert!(!bloom.test(&key_in_a), "target's own keys echoed back");
+        assert!(!bloom.test(&key_in_b));
+
+        // Unmark b: its keys now appear in the bloom for a.
+        blooms.set_no_redistribute(&peer_b, false);
+        let bloom = blooms.compute_send_bloom(&peer_a, &our_key);
+        assert!(bloom.test(&key_in_b));
+
+        // Dropping b off the tree yields a blank filter to send to it.
+        let blanks = blooms.update_on_tree(&our_key, &peer_a, &[]);
+        assert_eq!(blanks.len(), 1);
+        assert_eq!(blanks[0].0, peer_b);
+        assert_eq!(blanks[0].1.count_ones(), 0);
     }
 
     #[test]
