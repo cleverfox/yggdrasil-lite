@@ -37,7 +37,9 @@ use ygg_device::YggDevice;
 const TYPE_SESSION_TRAFFIC: u8 = 0x01;
 
 /// Maximum number of TCP sockets managed by smoltcp.
-const MAX_SOCKETS: usize = 16;
+// Headroom for the chat listener pool, active chats, reconnects, and one-shot
+// file-transfer sockets (closed sockets aren't reclaimed, so keep this roomy).
+const MAX_SOCKETS: usize = 128;
 
 /// Number of HTTP listener sockets kept armed in parallel, so that an active
 /// or stalled connection never leaves the port with nothing in LISTEN.
@@ -574,7 +576,10 @@ impl YggdrasilWasm {
         let url = alloc::string::String::from(ws_url);
 
         wasm_bindgen_futures::future_to_promise(async move {
-            let ws = WebSocket::new(&url)
+            // yggdrasil-go's WSS listener requires the "ygg-ws" subprotocol and
+            // closes the connection with 1008 otherwise. Servers that don't check
+            // it still accept the offer, so always request it.
+            let ws = WebSocket::new_with_str(&url, "ygg-ws")
                 .map_err(|e| JsValue::from_str(&alloc::format!("WebSocket::new failed: {:?}", e)))?;
             ws.set_binary_type(web_sys::BinaryType::Arraybuffer);
 
@@ -589,7 +594,7 @@ impl YggdrasilWasm {
             };
 
             // Channel to signal handshake completion
-            let (resolve_tx, resolve_rx) = futures_channel();
+            let (resolver, resolve_rx) = futures_channel();
 
             // --- onopen: send our metadata ---
             let meta_for_open = meta_bytes.clone();
@@ -615,7 +620,7 @@ impl YggdrasilWasm {
             let inner_msg = inner.clone();
             let meta_accum_msg = meta_accum.clone();
             let handshake_done_msg = handshake_done.clone();
-            let resolve_tx_msg = resolve_tx.clone();
+            let resolver_msg = resolver.clone();
             let onmessage = Closure::wrap(Box::new(move |event: MessageEvent| {
                 let data = event.data();
                 let buf = if let Ok(ab) = data.dyn_into::<js_sys::ArrayBuffer>() {
@@ -659,7 +664,7 @@ impl YggdrasilWasm {
                         }
 
                         // Signal completion
-                        let _ = resolve_tx_msg.borrow_mut().take().map(|f| f(pid));
+                        resolver_msg.resolve(pid);
 
                         log(&alloc::format!("[WS] Peer registered (id={})", pid));
                     }
@@ -673,21 +678,33 @@ impl YggdrasilWasm {
                 }
             }) as Box<dyn FnMut(MessageEvent)>);
 
+            // If the socket dies before the handshake finishes, reject the
+            // pending connect promise so the UI doesn't hang on "Connecting…".
+            let resolver_close = resolver.clone();
+            let handshake_done_close = handshake_done.clone();
             let onclose = Closure::wrap(Box::new(move || {
                 log("[WS] Connection closed");
+                if !*handshake_done_close.borrow() {
+                    resolver_close.reject();
+                }
             }) as Box<dyn FnMut()>);
 
+            let resolver_err = resolver.clone();
+            let handshake_done_err = handshake_done.clone();
             let onerror = Closure::wrap(Box::new(move || {
                 log("[WS] Connection error");
+                if !*handshake_done_err.borrow() {
+                    resolver_err.reject();
+                }
             }) as Box<dyn FnMut()>);
 
             ws.set_onmessage(Some(onmessage.as_ref().unchecked_ref()));
             ws.set_onclose(Some(onclose.as_ref().unchecked_ref()));
             ws.set_onerror(Some(onerror.as_ref().unchecked_ref()));
 
-            // Wait for handshake to complete
+            // Wait for handshake to complete (or the socket to die first).
             let pid = resolve_rx.await.map_err(|_| {
-                JsValue::from_str("Handshake channel closed")
+                JsValue::from_str("WebSocket closed before handshake (wrong URL or subprotocol?)")
             })?;
 
             // Register the WsPeer and auto-register the peer's key as a route
@@ -1125,6 +1142,36 @@ impl YggdrasilWasm {
         let sock = inner.sockets.get::<TcpSocket>(handle);
         alloc::format!("{}", sock.state())
     }
+
+    /// Remote peer's IPv6 address for this socket, or empty if not connected.
+    ///
+    /// Useful on the listening side to learn who dialed in: once an accepted
+    /// socket leaves `LISTEN`, the remote endpoint is populated.
+    pub fn tcp_remote(&self, index: u32) -> String {
+        let inner = self.inner.borrow();
+        let handle = match inner.tcp_handles.get(index as usize) {
+            Some(h) => *h,
+            None => return alloc::string::String::new(),
+        };
+        let sock = inner.sockets.get::<TcpSocket>(handle);
+        match sock.remote_endpoint() {
+            Some(ep) => alloc::format!("{}", ep.addr),
+            None => alloc::string::String::new(),
+        }
+    }
+
+    /// Gracefully close a TCP socket (sends FIN once the send buffer drains).
+    /// Used by one-shot file transfers: the sender closes after the last byte,
+    /// which the receiver sees as end-of-file.
+    pub fn tcp_close(&self, index: u32) {
+        let mut inner = self.inner.borrow_mut();
+        let handle = match inner.tcp_handles.get(index as usize) {
+            Some(h) => *h,
+            None => return,
+        };
+        let sock = inner.sockets.get_mut::<TcpSocket>(handle);
+        sock.close();
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1308,32 +1355,52 @@ fn parse_ipv6(s: &str) -> [u8; 16] {
 }
 
 /// Simple one-shot channel for the handshake completion signal.
-fn futures_channel() -> (
-    alloc::rc::Rc<RefCell<Option<Box<dyn FnOnce(yggdrasil_lite::PeerId)>>>>,
-    FutureChannel,
-) {
-    let result: alloc::rc::Rc<RefCell<Option<yggdrasil_lite::PeerId>>> =
-        alloc::rc::Rc::new(RefCell::new(None));
-    let waker: alloc::rc::Rc<RefCell<Option<core::task::Waker>>> =
-        alloc::rc::Rc::new(RefCell::new(None));
+type ChannelResult = alloc::rc::Rc<RefCell<Option<Result<yggdrasil_lite::PeerId, ()>>>>;
+type ChannelWaker = alloc::rc::Rc<RefCell<Option<core::task::Waker>>>;
 
-    let result_tx = result.clone();
-    let waker_tx = waker.clone();
-    let sender: alloc::rc::Rc<RefCell<Option<Box<dyn FnOnce(yggdrasil_lite::PeerId)>>>> =
-        alloc::rc::Rc::new(RefCell::new(Some(Box::new(move |pid| {
-            *result_tx.borrow_mut() = Some(pid);
-            if let Some(w) = waker_tx.borrow_mut().take() {
-                w.wake();
+/// Settles the handshake future. `resolve` on success, `reject` if the socket
+/// dies before the handshake completes (so the awaiting promise rejects instead
+/// of hanging forever). The first settle wins; later calls are ignored.
+#[derive(Clone)]
+struct Resolver {
+    result: ChannelResult,
+    waker: ChannelWaker,
+}
+
+impl Resolver {
+    fn settle(&self, v: Result<yggdrasil_lite::PeerId, ()>) {
+        {
+            let mut r = self.result.borrow_mut();
+            if r.is_some() {
+                return; // already settled
             }
-        }))));
+            *r = Some(v);
+        }
+        if let Some(w) = self.waker.borrow_mut().take() {
+            w.wake();
+        }
+    }
+    fn resolve(&self, pid: yggdrasil_lite::PeerId) {
+        self.settle(Ok(pid));
+    }
+    fn reject(&self) {
+        self.settle(Err(()));
+    }
+}
 
-    let receiver = FutureChannel { result, waker };
-    (sender, receiver)
+fn futures_channel() -> (Resolver, FutureChannel) {
+    let result: ChannelResult = alloc::rc::Rc::new(RefCell::new(None));
+    let waker: ChannelWaker = alloc::rc::Rc::new(RefCell::new(None));
+    let resolver = Resolver {
+        result: result.clone(),
+        waker: waker.clone(),
+    };
+    (resolver, FutureChannel { result, waker })
 }
 
 struct FutureChannel {
-    result: alloc::rc::Rc<RefCell<Option<yggdrasil_lite::PeerId>>>,
-    waker: alloc::rc::Rc<RefCell<Option<core::task::Waker>>>,
+    result: ChannelResult,
+    waker: ChannelWaker,
 }
 
 impl core::future::Future for FutureChannel {
@@ -1343,8 +1410,8 @@ impl core::future::Future for FutureChannel {
         self: core::pin::Pin<&mut Self>,
         cx: &mut core::task::Context<'_>,
     ) -> core::task::Poll<Self::Output> {
-        if let Some(pid) = self.result.borrow_mut().take() {
-            core::task::Poll::Ready(Ok(pid))
+        if let Some(v) = self.result.borrow_mut().take() {
+            core::task::Poll::Ready(v)
         } else {
             *self.waker.borrow_mut() = Some(cx.waker().clone());
             core::task::Poll::Pending

@@ -1,0 +1,114 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Yggdrasil P2P Chat</title>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body { font-family: monospace; background: #1a1a2e; color: #e0e0e0; padding: 20px; }
+        h1 { color: #53a8b6; margin-bottom: 20px; }
+        .section { background: #16213e; border-radius: 8px; padding: 16px; margin-bottom: 16px; }
+        .section h2 { color: #53a8b6; font-size: 14px; margin-bottom: 8px; }
+        label { display: block; margin-bottom: 4px; font-size: 12px; color: #888; }
+        input, button { font-family: monospace; font-size: 14px; padding: 8px 12px; border: 1px solid #333; border-radius: 4px; background: #0f3460; color: #e0e0e0; }
+        input { width: 100%; margin-bottom: 8px; }
+        button { cursor: pointer; margin-right: 8px; margin-bottom: 4px; }
+        button:hover { background: #1a4a80; }
+        button:disabled { opacity: 0.5; cursor: not-allowed; }
+        .row { display: flex; gap: 8px; align-items: flex-end; }
+        .row > div { flex: 1; }
+        .row > button { flex: 0 0 auto; height: 38px; }
+        .info { font-size: 13px; margin: 4px 0; word-break: break-all; }
+        .info span { color: #53a8b6; }
+
+        /* Tabs */
+        #tabs { display: flex; flex-wrap: wrap; gap: 4px; margin-bottom: 8px; }
+        .tab { padding: 6px 12px; border-radius: 4px 4px 0 0; background: #0f3460; cursor: pointer; font-size: 13px; border: 1px solid #333; border-bottom: none; user-select: none; }
+        .tab.active { background: #1a4a80; color: #fff; }
+        .tab.closed { opacity: 0.55; }
+        .tab .close { color: #c77; margin-left: 8px; }
+        /* iOS/macOS-style unread badge */
+        .badge { display: none; margin-left: 8px; background: #e0443e; color: #fff; border-radius: 10px; padding: 0 6px; font-size: 11px; line-height: 16px; min-width: 16px; text-align: center; vertical-align: middle; }
+        .badge.has-unread { display: inline-block; }
+        /* per-chat liveness indicator (keepalive) */
+        .alive-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; background: #888; vertical-align: middle; }
+        .alive-dot.up { background: #3ad15b; }
+        .alive-dot.down { background: #e0443e; }
+
+        /* Section header with inline control (mute) */
+        .section h2 .ctl { float: right; font-weight: normal; color: #888; font-size: 12px; }
+        .section h2 .ctl input { width: auto; margin: 0 4px 0 0; vertical-align: middle; }
+
+        /* Panes */
+        .pane { display: none; flex-direction: column; }
+        .pane.active { display: flex; }
+        .msglist { background: #0a0a1a; border-radius: 4px; padding: 12px; height: 360px; overflow-y: auto; font-size: 13px; line-height: 1.6; margin-bottom: 8px; }
+        .msg { padding: 2px 0; word-break: break-word; }
+        .msg .who { color: #53a8b6; }
+        .msg.me .who { color: #b6a853; }
+        .msg.sys { color: #888; font-style: italic; }
+        .msg .status { margin-left: 6px; font-size: 11px; color: #3ad15b; }
+        .msg .status.delivered { color: #3ad15b; }
+        .msg.file { color: #cdb4f0; }
+        .msg.file .dl { color: #53a8b6; text-decoration: underline; cursor: pointer; }
+        .sendrow { display: flex; gap: 8px; }
+        .sendrow input { margin-bottom: 0; }
+        .sendrow button { flex: 0 0 auto; }
+
+        #empty { color: #888; font-size: 13px; }
+
+        /* Log */
+        #log { background: #0a0a1a; border-radius: 4px; padding: 12px; height: 180px; overflow-y: auto; font-size: 12px; line-height: 1.6; white-space: pre-wrap; }
+        .log-entry { border-bottom: 1px solid #1a1a2e; padding: 2px 0; }
+    </style>
+</head>
+<body>
+    <h1>Yggdrasil P2P Chat</h1>
+
+    <div class="section">
+        <h2>This node</h2>
+        <div class="row">
+            <div>
+                <label>Your nickname</label>
+                <input type="text" id="nick" placeholder="Joe" />
+            </div>
+        </div>
+        <div class="info">Your address: <span id="node-addr">-</span></div>
+        <div class="info">Peers: <span id="node-peers">0</span> | Chat port: <span>2451/tcp</span></div>
+        <div class="info">Your chat link: <span id="chat-link">-</span></div>
+        <button id="btn-copy-link">Copy my chat link</button>
+    </div>
+
+    <div class="section" id="join-panel">
+        <h2>Join the overlay<label class="ctl"><input type="checkbox" id="autoconnect">autoconnect</label></h2>
+        <label>WebSocket peer URL (bridge into the Yggdrasil mesh)</label>
+        <div class="row">
+            <div><input type="text" id="peer-url" placeholder="wss://peer.example.com/yws" /></div>
+            <button id="btn-connect">Connect</button>
+        </div>
+    </div>
+
+    <div class="section">
+        <h2>Start a chat</h2>
+        <label>Peer's Yggdrasil IPv6 address</label>
+        <div class="row">
+            <div><input type="text" id="dial-addr" placeholder="200:abcd::1" /></div>
+            <button id="btn-dial">Start chat</button>
+        </div>
+    </div>
+
+    <div class="section">
+        <h2>Chats<label class="ctl"><input type="checkbox" id="allow-files">allow files</label><label class="ctl"><input type="checkbox" id="mute">mute sound</label></h2>
+        <div id="tabs"></div>
+        <div id="panes"><div id="empty">No chats yet. Connect to the overlay, then dial a peer — or wait for someone to dial you.</div></div>
+    </div>
+
+    <div class="section">
+        <h2>Log<label class="ctl"><input type="checkbox" id="debug-log">debug</label></h2>
+        <div id="log"></div>
+    </div>
+
+    <script type="module" src="app.js"></script>
+</body>
+</html>
